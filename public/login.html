@@ -1,0 +1,506 @@
+﻿<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>تسجيل الدخول | خطوط فودافون</title>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap"
+        rel="stylesheet">
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
+    <style>
+        :root {
+            --bg: #050505;
+            --c1: #ff0844;
+            --c2: #ffb199;
+            --c3: #e8eaed;
+            --card-bg: rgba(255, 255, 255, 0.03);
+            --border: rgba(255, 255, 255, 0.08);
+        }
+
+        body {
+            margin: 0;
+            padding: 20px 0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: var(--bg);
+            font-family: 'Tajawal', sans-serif;
+            color: #fff;
+            overflow-x: hidden;
+            overflow-y: auto;
+            position: relative;
+        }
+
+        /* Animated Background Elements */
+        .bg-blob {
+            position: absolute;
+            background: linear-gradient(to right, var(--c1), var(--c2));
+            filter: blur(100px);
+            border-radius: 50%;
+            opacity: 0.15;
+            z-index: 0;
+            animation: pulse 10s infinite alternate;
+        }
+
+        .bg-blob.top {
+            width: 300px;
+            height: 300px;
+            top: -100px;
+            right: -100px;
+        }
+
+        .bg-blob.bottom {
+            width: 350px;
+            height: 350px;
+            bottom: -100px;
+            left: -100px;
+            animation-duration: 15s;
+        }
+
+        @keyframes pulse {
+            0% {
+                transform: scale(1) translate(0, 0);
+                opacity: 0.15;
+            }
+
+            100% {
+                transform: scale(1.3) translate(-20px, 20px);
+                opacity: 0.25;
+            }
+        }
+
+        .login-container {
+            position: relative;
+            z-index: 10;
+            width: 100%;
+            max-width: 400px;
+            padding: 32px 24px;
+            box-sizing: border-box;
+            background: linear-gradient(160deg, rgba(28, 28, 30, 0.8), rgba(17, 17, 18, 0.9));
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border);
+            border-radius: 32px;
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+            margin: 20px;
+            animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            opacity: 0;
+            transform: translateY(30px);
+        }
+
+        @keyframes slideUp {
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .logo-area {
+            text-align: center;
+            margin-bottom: 8px;
+        }
+
+        .logo-circle {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.05);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px;
+            box-shadow: 0 10px 25px rgba(255, 8, 68, 0.3);
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            overflow: hidden;
+        }
+
+        .logo-circle img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            font-weight: 900;
+            background: linear-gradient(to right, #fff, #aaa);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+
+        p.subtitle {
+            margin: 8px 0 0;
+            font-size: 0.95rem;
+            color: #8e8e93;
+            text-align: center;
+        }
+
+        .form-group {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+
+        .form-group i.icon {
+            position: absolute;
+            right: 16px;
+            font-size: 1.3rem;
+            color: #8e8e93;
+            transition: color 0.3s;
+            z-index: 2;
+        }
+
+        .input-field {
+            width: 100%;
+            height: 56px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 0 46px 0 16px;
+            box-sizing: border-box;
+            color: #fff;
+            font-size: 1.05rem;
+            font-family: inherit;
+            transition: all 0.3s ease;
+        }
+
+        .input-field::placeholder {
+            color: #555;
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: var(--c1);
+            background: rgba(0, 0, 0, 0.5);
+            box-shadow: 0 0 0 4px rgba(255, 8, 68, 0.15);
+        }
+
+        .input-field:focus+i.icon,
+        .input-field:not(:placeholder-shown)+i.icon {
+            color: var(--c1);
+        }
+
+        /* Reverse siblings for CSS selector trick */
+        .form-group {
+            flex-direction: row-reverse;
+        }
+
+        .form-group i.icon {
+            right: auto;
+            left: 16px;
+            pointer-events: none;
+        }
+
+        .form-group i.icon.left-side {
+            left: auto;
+            right: 16px;
+        }
+
+        .input-field {
+            padding: 0 16px 0 46px;
+            direction: ltr;
+            text-align: right;
+        }
+
+        .input-field.arabic {
+            direction: rtl;
+            padding: 0 46px 0 16px;
+        }
+
+        .eye-icon {
+            position: absolute;
+            left: 16px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 1.3rem;
+            color: #8e8e93;
+            cursor: pointer;
+            z-index: 3;
+            transition: color 0.3s;
+        }
+
+        .eye-icon:hover {
+            color: #fff;
+        }
+
+        .btn-main {
+            width: 100%;
+            height: 56px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, var(--c1), var(--c2));
+            color: #fff;
+            font-size: 1.15rem;
+            font-weight: 800;
+            border: none;
+            cursor: pointer;
+            box-shadow: 0 8px 20px rgba(255, 8, 68, 0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: transform 0.2s, box-shadow 0.2s, filter 0.2s;
+            margin-top: 8px;
+        }
+
+        .btn-main:active {
+            transform: scale(0.97);
+            filter: brightness(0.9);
+        }
+
+        .btn-main.loading {
+            pointer-events: none;
+            opacity: 0.8;
+            letter-spacing: 2px;
+        }
+
+        .btn-register {
+            width: 100%;
+            height: 56px;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.05);
+            color: #fff;
+            font-size: 1.1rem;
+            font-weight: 700;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.3s;
+        }
+
+        .btn-register:active {
+            transform: scale(0.97);
+        }
+
+        .btn-register:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .divider {
+            display: flex;
+            align-items: center;
+            text-align: center;
+            color: #555;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .divider::before,
+        .divider::after {
+            content: '';
+            flex: 1;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .divider:not(:empty)::before {
+            margin-left: .5em;
+        }
+
+        .divider:not(:empty)::after {
+            margin-right: .5em;
+        }
+
+        .error-msg {
+            color: #ff5e62;
+            background: rgba(255, 0, 0, 0.1);
+            border-radius: 12px;
+            padding: 12px;
+            font-size: 0.9rem;
+            text-align: center;
+            display: none;
+            border: 1px solid rgba(255, 0, 0, 0.2);
+            font-weight: 600;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="bg-blob top"></div>
+    <div class="bg-blob bottom"></div>
+
+    <div class="login-container">
+        <div class="logo-area">
+            <div class="logo-circle">
+                <img src="logo.png" alt="Vodafone Line Logo">
+            </div>
+            <h1>مرحباً بك</h1>
+            <p class="subtitle">سجل دخول لمتابعة باقتك أو حجز جديد</p>
+        </div>
+
+        <div id="errorMsg" class="error-msg"></div>
+
+        <div>
+            <div class="form-group" style="margin-bottom: 16px;">
+                <input type="text" id="phone" class="input-field arabic" placeholder="رقم الهاتف أو الـ ID" />
+                <i class='bx bx-user icon left-side'></i>
+            </div>
+
+            <div class="form-group">
+                <input type="password" id="password" class="input-field arabic" placeholder="كلمة المرور"
+                    style="padding-left: 46px;" />
+                <i class='bx bx-lock-alt icon left-side' style="right: 16px; left: auto;"></i>
+                <i class='bx bx-hide eye-icon' onclick="togglePassword(this, 'password')"></i>
+            </div>
+        </div>
+
+        <button class="btn-main" id="btnLogin" onclick="doLogin()">
+            تسجيل الدخول <i class='bx bx-log-in-circle' style="font-size: 1.3rem;"></i>
+        </button>
+
+        <div class="divider">أو</div>
+
+        <button class="btn-register" id="btnRegister" onclick="doRegister()">
+            ✨ حجز جديد / اشتراك لأول مرة
+        </button>
+    </div>
+
+    <!-- Developer Footer -->
+    <div class="developer-footer"
+        style="position: relative; z-index: 10; margin: 40px auto 20px auto; padding-bottom: 20px; text-align: center; max-width: 400px; font-family: 'Inter', sans-serif;">
+        <div
+            style="display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 12px; opacity: 0.7;">
+            <div
+                style="height: 1px; flex: 1; background: linear-gradient(to right, transparent, rgba(255,255,255,0.15));">
+            </div>
+            <span style="color: #888; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2.5px;">Designed &
+                Developed by</span>
+            <div
+                style="height: 1px; flex: 1; background: linear-gradient(to left, transparent, rgba(255,255,255,0.15));">
+            </div>
+        </div>
+
+        <div style="color: #e0e0e0; font-size: 1.15rem; font-weight: 500; letter-spacing: 1px; margin-bottom: 15px;">
+            Hossam Ashour</div>
+
+        <div style="display: flex; justify-content: center; gap: 24px;">
+            <a href="https://www.facebook.com/share/19EWBmqJKF/" target="_blank"
+                style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;"
+                onmouseover="this.style.color='#1877F2'" onmouseout="this.style.color='#555'"><i
+                    class='bx bxl-facebook'></i></a>
+            <a href="https://www.instagram.com/hossam_ashourr?igsi=MXd3aG9henhrb2g3ZQ==" target="_blank"
+                style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;"
+                onmouseover="this.style.color='#E4405F'" onmouseout="this.style.color='#555'"><i
+                    class='bx bxl-instagram'></i></a>
+            <a href="https://wa.me/201101925305" target="_blank"
+                style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;"
+                onmouseover="this.style.color='#25D366'" onmouseout="this.style.color='#555'"><i
+                    class='bx bxl-whatsapp'></i></a>
+            <a href="https://t.me/hossam_ashourr" target="_blank"
+                style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;"
+                onmouseover="this.style.color='#0088cc'" onmouseout="this.style.color='#555'"><i
+                    class='bx bxl-telegram'></i></a>
+        </div>
+    </div>
+
+    <script>
+        async function doLogin() {
+            const phone = document.getElementById('phone').value.trim();
+            const pass = document.getElementById('password').value.trim();
+            const err = document.getElementById('errorMsg');
+            const btn = document.getElementById('btnLogin');
+
+            if (!phone) {
+                err.style.display = 'block';
+                err.innerHTML = 'يرجى إدخال رقم الهاتف أو الـ ID';
+                return;
+            }
+            if (phone !== '1255885099' && !pass) {
+                err.style.display = 'block';
+                err.innerHTML = 'يرجى إدخال كلمة المرور';
+                return;
+            }
+
+            err.style.display = 'none';
+            btn.classList.add('loading');
+            btn.innerHTML = '<i class="bx bx-loader-alt bx-spin"></i> جاري الدخول...';
+
+            try {
+                if (window.parent && window.parent.performAPIUnifiedLogin) {
+                    const res = await window.parent.performAPIUnifiedLogin(phone, pass);
+                    if (res.success) {
+                        window.parent.switchView(res.switchTo);
+                    } else {
+                        err.style.display = 'block';
+                        err.style.textAlign = 'right';
+                        err.style.background = 'transparent';
+                        err.style.border = 'none';
+                        err.style.padding = '0';
+                        err.innerHTML = `
+                            <div style="background: rgba(255,8,68,0.1); border: 1px solid rgba(255,8,68,0.3); border-radius: 12px; padding: 12px; margin-bottom: 12px;">
+                                <h4 style="margin: 0 0 4px 0; color: #ff0844; font-size: 1rem;"><i class='bx bx-error-circle'></i> الرقم غير مسجل</h4>
+                                <p style="margin: 0; color: #e8eaed; font-size: 0.85rem;">هذا الرقم غير مسجل في نظامنا حالياً.</p>
+                            </div>
+                            <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; padding: 12px; margin-bottom: 12px;">
+                                <p style="margin: 0 0 8px 0; color: #e8eaed; font-size: 0.85rem;">لو أنت مشترك بالفعل وحسابك لا يظهر، يُرجى التواصل مع الدعم الفني لحل المشكلة فوراً.</p>
+                                <a href="https://t.me/hak_alqulub" target="_blank" style="display: flex; align-items: center; justify-content: center; gap: 6px; background: rgba(0, 136, 204, 0.15); color: #0088cc; text-decoration: none; padding: 8px; border-radius: 8px; font-weight: bold; border: 1px solid rgba(0, 136, 204, 0.3); font-size: 0.9rem;">
+                                    <i class='bx bxl-telegram' style="font-size: 1.1rem;"></i> تواصل مع الدعم الفني
+                                </a>
+                            </div>
+                            <div style="background: rgba(46, 204, 113, 0.05); border: 1px solid rgba(46, 204, 113, 0.2); border-radius: 12px; padding: 12px;">
+                                <p style="margin: 0 0 8px 0; color: #e8eaed; font-size: 0.85rem;">لو دي أول مرة لك وتود الانضمام والاشتراك في باقاتنا:</p>
+                                <button onclick="doRegister()" style="display: flex; align-items: center; justify-content: center; width: 100%; gap: 6px; background: rgba(46, 204, 113, 0.2); color: #2ecc71; border: none; padding: 8px; border-radius: 8px; font-weight: bold; font-size: 0.9rem; cursor: pointer; transition: all 0.2s;">
+                                    ✨ اضغط هنا للحجز الآن
+                                </button>
+                            </div>
+                        `;
+                    }
+                } else {
+                    err.style.display = 'block';
+                    err.innerHTML = 'خطأ: لم يتم التعرف على النظام';
+                }
+            } catch (e) {
+                err.style.display = 'block';
+                err.innerHTML = 'حدث خطأ غير متوقع';
+            }
+
+            btn.classList.remove('loading');
+            btn.innerHTML = `تسجيل الدخول <i class='bx bx-log-in-circle' style="font-size: 1.3rem;"></i>`;
+        }
+
+        function togglePassword(icon, inputId) {
+            const input = document.getElementById(inputId);
+            if (input.type === 'password') {
+                input.type = 'text';
+                icon.classList.remove('bx-hide');
+                icon.classList.add('bx-show');
+                icon.style.color = '#ff0844';
+            } else {
+                input.type = 'password';
+                icon.classList.remove('bx-show');
+                icon.classList.add('bx-hide');
+                icon.style.color = '#8e8e93';
+            }
+        }
+
+        function doRegister() {
+            if (window.parent && window.parent.openRegisterModal) {
+                window.parent.openRegisterModal();
+            } else {
+                alert("امكانية التسجيل غير متوفرة الان");
+            }
+        }
+
+        // Add Enter key listener
+        document.getElementById('password').addEventListener('keyup', (e) => {
+            if (e.key === 'Enter') doLogin();
+        });
+        document.getElementById('phone').addEventListener('keyup', (e) => {
+            if (e.key === 'Enter') doLogin();
+        });
+    </script>
+</body>
+
+</html>

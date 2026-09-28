@@ -1,0 +1,21 @@
+94: CREATE TABLE IF NOT EXISTS bot_admins (
+146: SELECT setval('bot_admins_id_seq', COALESCE((SELECT MAX(id)+1 FROM bot_admins), 1), false);
+615: app.get('/api/admins', async (req, res) => {
+617: const admins = await dbAll(`SELECT * FROM bot_admins ORDER BY id ASC`);
+618: res.json({ success: true, data: admins });
+622: app.post('/api/admins', async (req, res) => {
+625: const result = await dbRun(`INSERT INTO bot_admins(tg_id, name) VALUES(?, ?)`, [tg_id, name || '']);
+626: res.json({ success: true, data: await dbGet(`SELECT * FROM bot_admins WHERE id = ? `, [result.lastID]) });
+630: app.delete('/api/admins/:id', async (req, res) => {
+632: await dbRun(`DELETE FROM bot_admins WHERE id = ? `, [req.params.id]);
+787: const admin = await dbGet(`SELECT * FROM bot_admins WHERE tg_id = ? OR tg_id = ?`, [tgId, username]);
+788: return !!admin;
+846: // Admin: send message to a specific user
+847: app.post('/api/admin/send-user-message', async (req, res) => {
+862: // Admin: manual bulk reminder
+863: app.post('/api/admin/manual-bulk-remind', async (req, res) => {
+893: // Customer: all users list for admin dashboard
+1027: // Admin/Payment gateway callback: verify a payment
+1074: // Admin: get all pending payments for review
+1136: // ===== CRON & ADMIN ACTIONS =====
+1141: app.post('/api/admin/check-password', async (req, res) => {

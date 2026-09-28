@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Vodafone Management V3</title>
+    <!-- Fonts & Icons -->
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800&display=swap"
+        rel="stylesheet">
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
+    <link rel="stylesheet" href="style.css?v=2">
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+
+<body>
+    <!-- ============ HEADER ============ -->
+    <header class="header" style="display:none">
+        <div class="header-inner">
+            <h1 class="logo glow-text">Vodafone Red</h1>
+        </div>
+    </header>
+
+    <!-- ============ INITIAL LOADER ============ -->
+    <div id="initialLoader"
+        style="display: flex; height: 100vh; width: 100%; justify-content: center; align-items: center; background: #000; flex-direction: column; position: fixed; top: 0; left: 0; z-index: 9999;">
+        <div class="spinner"
+            style="width: 40px; height: 40px; border: 4px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite;">
+        </div>
+        <p style="margin-top: 20px; color: var(--c3); font-weight: 500; letter-spacing: 1px;">جاري التحقق من
+            الصلاحيات...</p>
+    </div>
+
+    <!-- ============ LOGIN VIEW ============ -->
+    <div id="viewLogin" class="login-view" style="display: none; padding: 0; min-height: 100vh; position: relative;">
+        <iframe src="login.html" id="loginIframe"
+            style="width: 100%; height: 100vh; border: none; overflow: hidden; background: black;"></iframe>
+    </div>
+
+    <!-- ============ NEW ADMIN DASHBOARD ============ -->
+    <div id="viewAdminNew" style="display:none">
+        <iframe src="admin-ui.html" id="adminNewIframe"
+            style="width: 100%; height: 100vh; border: none; overflow: hidden; background: #0A0A0C;"></iframe>
+    </div>
+
+    <!-- ============ CUSTOMER DASHBOARD ============ -->
+    <div id="viewCustomer" style="display:none">
+        <iframe src="customer.html" id="customerIframe"
+            style="width: 100%; height: 100vh; border: none; overflow: hidden; background: black;"></iframe>
+    </div>
+
+    <!-- New Booking Registration Modal -->
+    <div id="registerModal" class="modal-overlay" onclick="closeModal('registerModal')"
+        style="backdrop-filter: blur(8px); background: rgba(0,0,0,0.6);">
+        <div class="modal" onclick="event.stopPropagation()"
+            style="background: linear-gradient(160deg, #1c1c1e, #111112); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 28px; box-shadow: 0 25px 50px rgba(0,0,0,0.5); overflow: hidden; width: 92%; max-width: 420px; padding: 0;">
+            <div class="modal-header"
+                style="background: rgba(255,255,255,0.03); padding: 24px; border-bottom: 1px solid rgba(255,255,255,0.05); text-align: center; position: relative;">
+                <h2
+                    style="font-size: 1.3rem; background: linear-gradient(45deg, #ff0844, #ffb199); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; margin: 0; font-weight: 800;">
+                    ✨ اشتراك جديد</h2>
+                <button class="modal-close" onclick="closeModal('registerModal')"
+                    style="position: absolute; left: 24px; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.1); border-radius: 50%; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; border: none; color: white; cursor: pointer; transition: background 0.3s;"><i
+                        class='bx bx-x' style="font-size: 1.2rem;"></i></button>
+            </div>
+            <div class="modal-body" style="padding: 24px;">
+                <!-- Step 1: Verification -->
+                <div id="regStep1">
+                    <p
+                        style="color: #9aa0a6; margin-bottom: 24px; font-size: 0.95rem; line-height: 1.6; text-align: center;">
+                        أهلاً بيك! عشان نبدأ نظبطلك الباقة، هنحتاج نتأكد من حسابك في "أنا فودافون" بكل أمان وخصوصية.
+                    </p>
+                    <div class="form-group" style="position: relative; margin-bottom: 16px;">
+                        <i class='bx bx-phone'
+                            style="position: absolute; right: 16px; top: 50%; transform: translateY(-50%); color: #ff0844; font-size: 1.3rem; z-index: 2;"></i>
+                        <input type="text" id="regPhone" class="form-input" placeholder="رقم فودافون (010...)"
+                            maxlength="11"
+                            style="background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.1); padding: 0 46px 0 16px; border-radius: 14px; height: 56px; font-size: 1.05rem; color: #fff; width: 100%; box-sizing: border-box; transition: all 0.3s ease;"
+                            onfocus="this.style.border='1px solid #ff0844'; this.style.boxShadow='0 0 0 4px rgba(255,8,68,0.15)'"
+                            onblur="this.style.border='1px solid rgba(255,255,255,0.1)'; this.style.boxShadow='none'" />
+                    </div>
+                    <div class="form-group" style="position: relative; margin-bottom: 28px;">
+                        <i class='bx bx-lock-alt'
+                            style="position: absolute; right: 16px; top: 50%; transform: translateY(-50%); color: #ff0844; font-size: 1.3rem; z-index: 2;"></i>
+                        <input type="password" id="regPassword" class="form-input" placeholder="باسورد أنا فودافون"
+                            style="background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.1); padding: 0 46px 0 46px; border-radius: 14px; height: 56px; font-size: 1.05rem; color: #fff; width: 100%; box-sizing: border-box; transition: all 0.3s ease;"
+                            onfocus="this.style.border='1px solid #ff0844'; this.style.boxShadow='0 0 0 4px rgba(255,8,68,0.15)'"
+                            onblur="this.style.border='1px solid rgba(255,255,255,0.1)'; this.style.boxShadow='none'" />
+                        <i class='bx bx-hide'
+                            style="position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #8e8e93; font-size: 1.3rem; cursor: pointer; z-index: 3; transition: color 0.3s;"
+                            onmouseover="this.style.color='#fff'"
+                            onmouseout="if(document.getElementById('regPassword').type === 'password') this.style.color='#8e8e93'"
+                            onclick="const inp = document.getElementById('regPassword'); if(inp.type==='password'){inp.type='text'; this.classList.remove('bx-hide'); this.classList.add('bx-show'); this.style.color='#ff0844';}else{inp.type='password'; this.classList.remove('bx-show'); this.classList.add('bx-hide'); this.style.color='#8e8e93';}"></i>
+                    </div>
+                    <button class="btn" id="regVerifyBtn" onclick="submitRegisterVerify()"
+                        style="width: 100%; height: 56px; border-radius: 14px; background: linear-gradient(135deg, #ff0844, #ff5e62); color: white; font-weight: 700; font-size: 1.1rem; border: none; box-shadow: 0 8px 20px rgba(255, 8, 68, 0.4); cursor: pointer; transition: transform 0.2s, box-shadow 0.2s, filter 0.2s;"
+                        onmousedown="this.style.transform='scale(0.98)'" onmouseup="this.style.transform='scale(1)'">
+                        تأكيد البيانات <i class='bx bx-right-arrow-alt'
+                            style="font-size: 1.3rem; vertical-align: middle; margin-right: 6px;"></i>
+                    </button>
+                    <p
+                        style="text-align: center; color: #666; font-size: 0.8rem; margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 4px;">
+                        <i class='bx bx-shield-quarter'></i> بياناتك مشفرة ومحمية بنسبة ١٠٠٪
+                    </p>
+                </div>
+
+                <!-- Step 2: Choose Package -->
+                <div id="regStep2" style="display:none">
+                    <div
+                        style="background: rgba(46, 204, 113, 0.05); border: 1px solid rgba(46, 204, 113, 0.2); border-radius: 16px; padding: 20px; text-align: center; margin-bottom: 24px; position: relative; overflow: hidden;">
+                        <div
+                            style="position: absolute; top: -20px; left: -20px; width: 100px; height: 100px; background: radial-gradient(circle, rgba(46,204,113,0.2) 0%, transparent 70%);">
+                        </div>
+                        <div
+                            style="width: 56px; height: 56px; background: linear-gradient(135deg, #2ecc71, #27ae60); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 12px; box-shadow: 0 8px 20px rgba(46, 204, 113, 0.3);">
+                            <i class='bx bx-check' style="color: white; font-size: 2.5rem;"></i>
+                        </div>
+                        <h3 style="color: #2ecc71; margin: 0 0 6px 0; font-size: 1.2rem; font-weight: 800;">تم التحقق
+                            بنجاح!</h3>
+                        <p id="regUserInfo" style="margin: 0; color: #e8eaed; font-size: 0.95rem; font-weight: 600;">
+                        </p>
+                    </div>
+                    <h3
+                        style="color: #fff; font-size: 1.1rem; font-weight: 700; margin-bottom: 16px; text-align: right; padding-right: 4px;">
+                        اختر الباقة المناسبة لك:</h3>
+                    <div id="regPackages"
+                        style="display: flex; flex-direction: column; gap: 14px; max-height: 40vh; overflow-y: auto; padding: 4px; border-radius: 12px;">
+                        <!-- Packages injected dynamically -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Payment Modal -->
+    <div id="paymentModal" class="modal-overlay" onclick="closeModal('paymentModal')">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h2>💳 دفع التجديد</h2>
+                <button class="modal-close" onclick="closeModal('paymentModal')">✕</button>
+            </div>
+            <div class="modal-body">
+                <!-- Step 1: Payment Method -->
+                <div id="payStep1">
+                    <div class="pay-info-card" id="payBookingInfo"></div>
+
+                    <!-- Status Notification Banner (Already Paid / Pending / Rejected) -->
+                    <div id="payStatusNotice" style="display:none; margin-bottom: 15px;"></div>
+
+                    <div id="payFormWrapper">
+                        <div class="pay-methods">
+                            <h3 style="margin-bottom: 12px; font-size: 0.95rem; font-weight: 700;">اختر طريقة الدفع</h3>
+                            <div class="pay-method-grid">
+                                <button class="pay-method-btn active" data-method="vodafone_cash"
+                                    onclick="selectPayMethod('vodafone_cash', this)">
+                                    <div class="pay-method-icon">📱</div>
+                                    <div class="pay-method-name">فودافون كاش</div>
+                                </button>
+                                <button class="pay-method-btn" data-method="instapay"
+                                    onclick="selectPayMethod('instapay', this)">
+                                    <div class="pay-method-icon">🏦</div>
+                                    <div class="pay-method-name">إنستا باي</div>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="pay-instructions" id="payInstructions">
+                            <!-- Populated dynamically with 1-click copy -->
+                        </div>
+
+                        <div class="form-group" id="groupSenderPhone" style="margin-top: 15px;">
+                            <label id="lblSenderPhone">📞 رقم فودافون كاش المحول منه (11 رقم) <span style="color:#ef4444">*</span></label>
+                            <input type="text" id="paySenderPhone" class="form-input" placeholder="010XXXXXXXX" />
+                        </div>
+
+                        <div class="form-group" id="groupSenderName" style="display:none; margin-top: 15px;">
+                            <label id="lblSenderName">👤 اسم الحساب أو عنوان إنستا باي (IPA) المحول منه <span style="color:#ef4444">*</span></label>
+                            <input type="text" id="paySenderName" class="form-input" placeholder="مثال: ahmed@instapay أو اسمك في إنستا باي" />
+                        </div>
+
+                        <div class="form-group" id="groupTransRef" style="display:block; margin-top: 12px;">
+                            <label id="lblTransRef">🔢 رقم العملية / المرجع المالي (اختياري)</label>
+                            <input type="text" id="payTransRef" class="form-input"
+                                placeholder="أدخل رقم العملية من رسالة التأكيد إن وجد" />
+                        </div>
+
+                        <div class="form-group" id="groupScreenshot" style="display:block; margin-top: 12px;">
+                            <label>📸 صورة / سكرين شوت إيصال التحويل <span style="color:#ef4444; font-weight:bold;">*</span></label>
+                            <input type="file" id="payScreenshot" class="form-input" accept="image/*"
+                                style="padding: 8px; background: var(--bg-card); border: 1px dashed var(--border); cursor: pointer;"
+                                onchange="handleScreenshotPreview(this)" />
+                            <div id="payScreenshotPreview" style="display:none; margin-top: 8px; text-align: center; background: rgba(0,0,0,0.25); padding: 8px; border-radius: 8px;">
+                                <img id="payScreenshotImg" src="" alt="معاينة الإيصال" style="max-height: 140px; border-radius: 6px; border: 1px solid var(--border); margin: 0 auto; display: block;" />
+                                <button type="button" onclick="clearScreenshotPreview()" style="margin-top: 6px; font-size: 0.78rem; color: #ef4444; background: none; border: none; cursor: pointer; text-decoration: underline;">✕ إزالة الصورة</button>
+                            </div>
+                        </div>
+
+                        <p id="payProofHint"
+                            style="font-size: 0.8rem; color: var(--c2); margin-top: 10px; margin-bottom: 12px; text-align: center;">
+                            ⚠️ ارفع صورة إيصال التحويل لتأكيد باقتك سريعاً
+                        </p>
+
+                        <button class="btn btn-primary pay-submit-btn" id="paySubmitBtn" onclick="submitPayment()">
+                            <i class='bx bx-send'></i> إرسال وتأكيد الدفع
+                        </button>
+                    </div>
+
+                    <div id="payAlreadyPaidActions" style="display:none; text-align:center; margin-top: 15px;">
+                        <button class="btn btn-ghost" onclick="closeModal('paymentModal')" style="width: 100%;">إغلاق النافذة</button>
+                    </div>
+                </div>
+
+                <!-- Step 2: Verification Progress -->
+                <div id="payStep2" style="display:none">
+                    <div class="verification-loader" id="payLoader">
+                        <div class="spinner"></div>
+                        <h3 style="margin-top:20px; font-size:1.1rem">جاري التحقق من الدفع...</h3>
+                        <p style="color:var(--c3); margin-top:8px">يرجى الانتظار، لا تقم بإغلاق هذه النافذة</p>
+                    </div>
+                    <div class="verification-result" id="payResult" style="display:none; text-align:center;">
+                        <div id="payResultIcon" style="font-size: 5rem; margin-bottom:15px"></div>
+                        <h3 id="payResultTitle" style="font-size: 1.25rem; font-weight:700"></h3>
+                        <p id="payResultDesc" style="color:var(--c3); margin-top:10px; line-height:1.6;"></p>
+
+                        <!-- Hidden support section for fallback -->
+                        <div id="paySupportSection"
+                            style="display:none; margin-top: 25px; padding-top: 20px; border-top: 1px solid var(--border);">
+                            <p style="font-size:0.9rem; margin-bottom:12px">إذا كنت متأكداً من الدفع، يرجى التواصل
+                                مع الدعم الفني وإرسال صورة التحويل:</p>
+                            <a href="https://t.me/hak_alqulub" target="_blank" class="btn btn-primary"
+                                style="display:inline-flex; width:auto; padding: 10px 24px;">
+                                <i class='bx bxl-telegram'></i> تواصل مع الدعم
+                            </a>
+                        </div>
+
+                        <button class="btn btn-ghost" style="margin-top: 20px"
+                            onclick="closeModal('paymentModal')">إغلاق</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- Toast -->
+    <div id="toast" class="toast"></div>
+
+    <script src="app.js?v=7"></script>
+    <div class="developer-footer"
+        style="margin: 40px auto 20px auto; padding-bottom: 20px; text-align: center; max-width: 400px; font-family: 'Inter', sans-serif;">
+        <div
+            style="display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 12px; opacity: 0.7;">
+            <div
+                style="height: 1px; flex: 1; background: linear-gradient(to right, transparent, rgba(255,255,255,0.15));">
+            </div>
+            <span style="color: #888; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2.5px;">Designed &
+                Developed by</span>
+            <div
+                style="height: 1px; flex: 1; background: linear-gradient(to left, transparent, rgba(255,255,255,0.15));">
+            </div>
+        </div>
+
+        <div style="color: #e0e0e0; font-size: 1.15rem; font-weight: 500; letter-spacing: 1px; margin-bottom: 15px;">
+            Hossam Ashour</div>
+
+        <div style="display: flex; justify-content: center; gap: 24px;">
+            <a href="https://www.facebook.com/share/19EWBmqJKF/" target="_blank"
+                style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;"
+                onmouseover="this.style.color='#1877F2'" onmouseout="this.style.color='#555'"><i
+                    class='bx bxl-facebook'></i></a>
+            <a href="https://www.instagram.com/hossam_ashourr?igsi=MXd3aG9henhrb2g3ZQ==" target="_blank"
+                style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;"
+                onmouseover="this.style.color='#E4405F'" onmouseout="this.style.color='#555'"><i
+                    class='bx bxl-instagram'></i></a>
+            <a href="https://wa.me/201101925305" target="_blank"
+                style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;"
+                onmouseover="this.style.color='#25D366'" onmouseout="this.style.color='#555'"><i
+                    class='bx bxl-whatsapp'></i></a>
+            <a href="https://t.me/hossam_ashourr" target="_blank"
+                style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;"
+                onmouseover="this.style.color='#0088cc'" onmouseout="this.style.color='#555'"><i
+                    class='bx bxl-telegram'></i></a>
+        </div>
+    </div>
+</body>
+
+</html>

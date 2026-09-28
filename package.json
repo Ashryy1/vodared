@@ -1,0 +1,18 @@
+{
+  "name": "red-renewal",
+  "version": "1.0.0",
+  "description": "Vodafone Red Booking System",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^149.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "pg": "^8.23.0",
+    "puppeteer-core": "^25.6.0",
+    "sqlite3": "^6.0.1"
+  }
+}
