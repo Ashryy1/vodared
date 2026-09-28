@@ -671,47 +671,152 @@ function decodeJwt(token) {
     } catch (e) { return null; }
 }
 
-async function fetchAllData(token, cookies, msisdn) {
-    const h = {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Cookie: cookies.join("; "),
-        Referer: "https://web.vodafone.com.eg/spa/myHome",
-        Origin: "https://web.vodafone.com.eg",
-        msisdn,
-    };
+function isRecord(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
-    const endpoints = [
-        { key: "balance", url: "https://web.vodafone.com.eg/services/DigitalExperience/prepaid/balance" },
-        { key: "billing", url: "https://web.vodafone.com.eg/services/DigitalExperience/billing/balance" },
-        { key: "billOverview", url: "https://web.vodafone.com.eg/services/DigitalExperience/billing/billOverview" },
-        { key: "usage", url: "https://web.vodafone.com.eg/services/DigitalExperience/usage/summary" },
-        { key: "subscriptions", url: "https://web.vodafone.com.eg/services/DigitalExperience/subscriptions" }
+function asNumber(value) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+        const parsed = Number(value.replace(/,/g, ""));
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+}
+
+function asString(value) {
+    if (typeof value === "string") return value;
+    if (typeof value === "number") return String(value);
+    return null;
+}
+
+function parseUsageConsumptionResponse(data) {
+    if (!Array.isArray(data)) return [];
+    const items = [];
+
+    for (const entry of data) {
+        if (!isRecord(entry)) continue;
+        const entryType = asString(entry["@type"]) || "";
+        const buckets = Array.isArray(entry.bucket) ? entry.bucket : [];
+
+        for (const bucket of buckets) {
+            if (!isRecord(bucket)) continue;
+            const balances = Array.isArray(bucket.bucketBalance) ? bucket.bucketBalance : [];
+            const counters = Array.isArray(bucket.bucketCounter) ? bucket.bucketCounter : [];
+            const products = Array.isArray(bucket.product) ? bucket.product : [];
+
+            const activeProducts = products
+                .filter(isRecord)
+                .map((p) => ({
+                    id: asString(p.id) || "",
+                    name: asString(p.name) || "",
+                }))
+                .filter((p) => p.name);
+
+            const productName = activeProducts.length > 0 ? activeProducts[0].name : null;
+            const usageType = asString(bucket.usageType) || productName || entryType || "Unknown";
+
+            let remaining = null;
+            let used = null;
+            let unit = "UNIT";
+            let renewableDate = null;
+
+            if (balances.length > 0) {
+                const b0 = balances[0];
+                remaining = asNumber(b0.remainingValue?.amount);
+                unit = asString(b0.remainingValue?.units) || unit;
+                renewableDate = b0.validFor?.endDateTime || b0.validFor?.endDate || null;
+            }
+
+            if (counters.length > 0) {
+                const c0 = counters[0];
+                used = asNumber(c0.value?.amount);
+                unit = asString(c0.value?.units) || unit;
+            }
+
+            items.push({
+                label: productName || usageType,
+                usageType,
+                entryType,
+                unit,
+                used: used ?? 0,
+                remaining: remaining ?? 0,
+                total: (used || 0) + (remaining || 0),
+                renewableDate,
+                products: activeProducts,
+            });
+        }
+    }
+    return items;
+}
+
+function buildUsageSummary(items) {
+    const res = [];
+    const rules = [
+        {
+            key: "data",
+            title: "كوتة الإنترنت (الشهر الحالي)",
+            category: "current",
+            icon: "wifi",
+            match: (i) => i.usageType?.toUpperCase() === "DATA" || i.entryType?.toUpperCase() === "DATA",
+        },
+        {
+            key: "voice",
+            title: "دقائق المكالمات (الشهر الحالي)",
+            category: "current",
+            icon: "phone",
+            match: (i) => i.usageType?.toUpperCase() === "VOICE",
+        },
+        {
+            key: "family",
+            title: "دقائق العيلة",
+            category: "current",
+            icon: "users",
+            match: (i) => i.usageType?.toUpperCase().includes("FAMILY") || i.entryType?.toUpperCase() === "FAMILY",
+        },
+        {
+            key: "sms",
+            title: "رسائل الشهر الحالي",
+            category: "current",
+            icon: "message",
+            match: (i) => i.usageType?.toUpperCase() === "SMS",
+        },
+        {
+            key: "nc_mi",
+            title: "جيجات الشهر القادم",
+            category: "next",
+            icon: "calendar_data",
+            match: (i) => i.usageType?.toLowerCase() === "nc - mi",
+        },
+        {
+            key: "nc_voice",
+            title: "دقائق الشهر القادم",
+            category: "next",
+            icon: "calendar_voice",
+            match: (i) => i.usageType?.toLowerCase() === "nc - voice",
+        },
+        {
+            key: "nc_sms",
+            title: "رسائل الشهر القادم",
+            category: "next",
+            icon: "calendar_sms",
+            match: (i) => i.usageType?.toLowerCase() === "nc - sms",
+        },
     ];
 
-    const results = {};
-    const settled = await Promise.allSettled(
-        endpoints.map(async (ep) => {
-            try {
-                // simple fetch with 10s timeout using AbortController if available
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 10000);
-                const r = await fetch(ep.url, { headers: h, signal: controller.signal });
-                clearTimeout(timeout);
-                if (r.ok) {
-                    const ct = r.headers.get("content-type") || "";
-                    if (ct.includes("json")) return { key: ep.key, data: await r.json() };
-                }
-                return { key: ep.key, data: null };
-            } catch (e) { return { key: ep.key, data: null }; }
-        })
-    );
-    for (const s of settled) {
-        if (s.status === "fulfilled" && s.value.data) results[s.value.key] = s.value.data;
+    for (const r of rules) {
+        const item = items.find(r.match);
+        if (item) {
+            res.push({
+                key: r.key,
+                title: r.title,
+                category: r.category,
+                icon: r.icon,
+                ...item,
+            });
+        }
     }
-    return results;
+    return res;
 }
 
 async function fastVodafoneCheck(msisdn, password) {
@@ -736,14 +841,26 @@ async function fastVodafoneCheck(msisdn, password) {
 
     const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
+    // Cookie jar map to avoid duplicate cookie keys
+    const cookieMap = new Map();
+    const addCookies = (res) => {
+        const getSetCookieFn = res.headers.getSetCookie;
+        const rawCookies = (typeof getSetCookieFn === 'function')
+            ? res.headers.getSetCookie()
+            : [res.headers.get('set-cookie')].filter(Boolean);
+        for (const sc of rawCookies) {
+            if (sc) {
+                const kv = sc.split(";")[0];
+                const eq = kv.indexOf("=");
+                if (eq > 0) cookieMap.set(kv.slice(0, eq).trim(), kv.slice(eq + 1).trim());
+            }
+        }
+    };
+    const getCookieStr = () => Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+
     // 1. Initial Page
     const pageRes = await fetch(authUrl.toString(), { redirect: "manual", headers: { "User-Agent": ua, Accept: "text/html" } });
-    const cookies = [];
-    const getSetCookieFn = pageRes.headers.getSetCookie;
-    const rawCookies = (typeof getSetCookieFn === 'function') ? pageRes.headers.getSetCookie() : [pageRes.headers.get('set-cookie')].filter(Boolean);
-    for (const sc of rawCookies) {
-        if (sc) { const c = sc.split(";")[0]; if (c) cookies.push(c); }
-    }
+    addCookies(pageRes);
 
     const html = await pageRes.text();
     const formAction = extractFormAction(html);
@@ -752,13 +869,17 @@ async function fastVodafoneCheck(msisdn, password) {
     // 2. Submit Login
     const loginRes = await fetch(formAction, {
         method: "POST", redirect: "manual",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: cookies.join("; "), "User-Agent": ua, Referer: authUrl.toString(), Origin: "https://web.vodafone.com.eg" },
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            Cookie: getCookieStr(),
+            "User-Agent": ua,
+            Referer: authUrl.toString(),
+            Origin: "https://web.vodafone.com.eg"
+        },
         body: new URLSearchParams({ username: clean, password }).toString(),
     });
+    addCookies(loginRes);
     const redir = loginRes.headers.get("location");
-    for (const sc of ((typeof getSetCookieFn === 'function') ? loginRes.headers.getSetCookie() : [loginRes.headers.get('set-cookie')].filter(Boolean))) {
-        if (sc) { const c = sc.split(";")[0]; if (c) cookies.push(c); }
-    }
 
     if (!redir) {
         const b = await loginRes.text();
@@ -774,29 +895,134 @@ async function fastVodafoneCheck(msisdn, password) {
     // 3. Token Exchange
     const tokenRes = await fetch("https://web.vodafone.com.eg/auth/realms/vf-realm/protocol/openid-connect/token", {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: cookies.join("; "), "User-Agent": ua },
-        body: new URLSearchParams({ grant_type: "authorization_code", client_id: "website", code, redirect_uri: "https://web.vodafone.com.eg/spa/myHome", code_verifier: codeVerifier }).toString(),
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: getCookieStr(), "User-Agent": ua },
+        body: new URLSearchParams({
+            grant_type: "authorization_code",
+            client_id: "website",
+            code,
+            redirect_uri: "https://web.vodafone.com.eg/spa/myHome",
+            code_verifier: codeVerifier
+        }).toString(),
     });
     if (!tokenRes.ok) return { valid: true, message: 'الدخول صحيح لكن مسحوب أو توكن خطأ' };
 
     const tokens = await tokenRes.json();
-    const jwt = decodeJwt(tokens.access_token);
+    const accessToken = tokens.access_token;
+    const jwt = decodeJwt(accessToken);
     const userInfo = jwt?.userInfo || null;
 
-    // 4. Fetch Extra Data
-    const extra = await fetchAllData(tokens.access_token, cookies, clean);
+    // 4. Fetch Real-Time Usage Consumption Report (DXL API)
+    // IMPORTANT: Do NOT send F5 BIG-IP /auth cookies to /services/dxl/usage or F5 WAF rejects with 555.
+    // Instead send clientId: 'WebsiteConsumer' + msisdn header.
+    let quotaItems = [];
+    let quotaSummary = [];
+    let renewableDate = null;
+    try {
+        const usageUrl = `https://web.vodafone.com.eg/services/dxl/usage/usageConsumptionReport?bucket.product.publicIdentifier=${clean}&@type=aggregated`;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12000);
+        const usageRes = await fetch(usageUrl, {
+            headers: {
+                "User-Agent": ua,
+                Authorization: `Bearer ${accessToken}`,
+                clientId: "WebsiteConsumer",
+                msisdn: clean,
+                "Accept-Language": "AR",
+                Accept: "application/json",
+                "Content-Type": "application/json",
+                Referer: "https://web.vodafone.com.eg/spa/myHome",
+            },
+            signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        if (usageRes.ok) {
+            const rawUsage = await usageRes.json();
+            quotaItems = parseUsageConsumptionResponse(rawUsage);
+            quotaSummary = buildUsageSummary(quotaItems);
+            const firstWithDate = quotaSummary.find((q) => q.renewableDate) || quotaItems.find((q) => q.renewableDate);
+            if (firstWithDate) renewableDate = firstWithDate.renewableDate;
+        }
+    } catch (err) {
+        console.error("Usage fetch warning:", err.message);
+    }
+
+    const tariffItem = quotaItems.find((i) => i.entryType?.toLowerCase() === "tariff" || i.usageType?.toLowerCase() === "tariff");
+
     const data = {
         name: userInfo ? `${userInfo.firstName || ""} ${userInfo.lastName || ""}`.trim() : null,
         msisdn: userInfo?.msisdn || clean,
         currentPlan: userInfo?.serviceClassName || userInfo?.contractSubType || null,
+        customerType: userInfo?.customerType || null,
+        contractStatus: userInfo?.contractStatus || "ACTIVE",
+        paymentType: userInfo?.paymentType || null,
         loyaltyStatus: userInfo?.isLoyalAuthorized === "Y" ? "مؤهل" : "غير مؤهل",
-        balance: extra.balance ? String(extra.balance.balance ?? extra.balance.currentBalance ?? "") : null,
-        usageSummary: extra.usage || null,
-        rawUserInfo: userInfo
+        balance: tariffItem ? String(tariffItem.remaining ?? "") : null,
+        renewableDate,
+        quotaSummary,
+        quotaItems,
+        rawUserInfo: userInfo,
+        fetchedAt: new Date().toISOString()
     };
 
-    return { valid: true, message: 'الباسورد صحيح وتم الدخول ✅', details: data };
+    return { valid: true, message: 'الباسورد صحيح وتم جلب الاستهلاك بنجاح ✅', details: data };
 }
+
+// Unified Real-time Usage Consumption Endpoint (for Customer Dashboard & Admin/Employee Panel)
+app.post('/api/usage', async (req, res) => {
+    try {
+        let { booking_id, phone, password } = req.body || {};
+        let bookingRow = null;
+
+        if (booking_id && (!phone || !password)) {
+            bookingRow = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [booking_id]);
+            if (bookingRow) {
+                phone = phone || bookingRow.phone;
+                password = password || bookingRow.password;
+            }
+        }
+
+        if (phone && !password) {
+            const cleanPhone = toEnglish(String(phone).trim());
+            bookingRow = await dbGet(`SELECT * FROM bookings WHERE phone = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`, [cleanPhone]);
+            if (bookingRow) {
+                password = bookingRow.password;
+            }
+        }
+
+        if (!phone || !password) {
+            return res.status(400).json({
+                success: false,
+                error: 'رقم الموبايل أو باسورد أنا فودافون غير مسجل لهذا الخط.'
+            });
+        }
+
+        const result = await fastVodafoneCheck(toEnglish(String(phone).trim()), String(password).trim());
+        if (!result.valid) {
+            return res.json({
+                success: false,
+                error: result.message || 'فشل تسجيل الدخول في فودافون (تأكد من صحة باسورد أنا فودافون).'
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: result.message,
+            data: {
+                ...(result.details || {}),
+                booking: bookingRow ? {
+                    id: bookingRow.id,
+                    phone: bookingRow.phone,
+                    gigabytes: bookingRow.gigabytes,
+                    renewal_day: bookingRow.renewal_day,
+                    status: bookingRow.status
+                } : null
+            }
+        });
+    } catch (e) {
+        console.error('Error in /api/usage:', e);
+        return res.status(500).json({ success: false, error: 'حدث خطأ أثناء جلب الاستهلاك: ' + e.message });
+    }
+});
 
 app.post('/api/vf-check', async (req, res) => {
     const { phone, password } = req.body;
@@ -814,10 +1040,6 @@ app.post('/api/customer/register-verify', async (req, res) => {
     const { phone, password } = req.body;
     if (!phone || !password) return res.status(400).json({ success: false, error: 'أدخل الرقم والباسورد' });
     try {
-        // Check if has pending first_time request for this EXACT gigabytes / renewal_day combination, or just don't check at all.
-        // We will just allow them to make a new booking unconditionally!
-        // No blocking for existing bookings as per user request.
-
         // Verify with Vodafone
         const result = await fastVodafoneCheck(phone, password);
         if (!result.valid) {
@@ -939,9 +1161,10 @@ app.get('/api/cron', async (req, res) => {
 
 let activeBot = null;
 let activeBotToken = null;
+let webhookEnsuredForToken = null;
 
 async function getBot() {
-    let token = process.env.BOT_TOKEN;
+    let token = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_TOKEN;
     if (!token) {
         try {
             const row = await dbGet(`SELECT value FROM settings WHERE key = 'telegram_token'`);
@@ -962,6 +1185,15 @@ async function getBot() {
         activeBotToken = token;
         activeBot = new TelegramBot(activeBotToken);
         bindBotEvents(activeBot);
+
+        // Automatically ensure Telegram webhook is bound when running on Vercel
+        if ((process.env.VERCEL || process.env.VERCEL_ENV) && webhookEnsuredForToken !== token) {
+            webhookEnsuredForToken = token;
+            const baseUrl = (process.env.WEBAPP_URL || 'https://vodared.vercel.app').trim().replace(/\/$/, '');
+            activeBot.setWebHook(`${baseUrl}/api/webhook`).catch(err => {
+                console.error('Auto webhook setup warning:', err.message);
+            });
+        }
     }
     return activeBot;
 }
