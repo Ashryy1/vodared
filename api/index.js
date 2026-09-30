@@ -344,7 +344,7 @@ app.post('/api/bookings', async (req, res) => {
             createdAtVal = new Date(`${added_month_override}-01T00:00:00Z`).toISOString();
         }
 
-        const initialStatus = status || 'متأكتف';
+        const initialStatus = status || 'محجوز';
         const result = await dbRun(
             `INSERT INTO bookings(phone, password, gigabytes, renewal_day, status, created_at) VALUES(?, ?, ?, ?, ?, ?)`,
             [phone.trim(), password.trim(), Number(gigabytes), Number(renewal_day), initialStatus, createdAtVal]
@@ -725,7 +725,8 @@ function parseUsageConsumptionResponse(data) {
                 const b0 = balances[0];
                 remaining = asNumber(b0.remainingValue?.amount);
                 unit = asString(b0.remainingValue?.units) || unit;
-                renewableDate = b0.validFor?.endDateTime || b0.validFor?.endDate || null;
+                const rawDate = b0.validFor?.endDateTime || b0.validFor?.endDate || null;
+                renewableDate = rawDate ? String(rawDate).split('T')[0] : null;
             }
 
             if (counters.length > 0) {
@@ -2067,7 +2068,7 @@ app.post('/api/customer/verify-payment', async (req, res) => {
             if (payment.payment_type === 'first_time' && !targetBookingId) {
                 // We MUST create the booking now that it is approved!
                 const newBooking = await dbRun(
-                    `INSERT INTO bookings(phone, password, gigabytes, status, renewal_day, created_at) VALUES(?, ?, ?, 'اتجاب', ?, CURRENT_TIMESTAMP)`,
+                    `INSERT INTO bookings(phone, password, gigabytes, status, renewal_day, created_at) VALUES(?, ?, ?, 'محجوز', ?, CURRENT_TIMESTAMP)`,
                     [payment.phone, payment.password || '1234', payment.gigabytes, payment.renewal_day || 7]
                 );
                 targetBookingId = newBooking.lastID;
@@ -2459,7 +2460,7 @@ app.post('/api/payments/:id/approve', async (req, res) => {
                 await dbRun(`UPDATE customer_payments SET booking_id = ? WHERE id = ?`, [targetBookingId, payment_id]);
             } else {
                 const bookingResult = await dbRun(
-                    `INSERT INTO bookings(phone, password, gigabytes, renewal_day, status, created_at) VALUES(?, ?, ?, ?, 'متأكتف', CURRENT_TIMESTAMP)`,
+                    `INSERT INTO bookings(phone, password, gigabytes, renewal_day, status, created_at) VALUES(?, ?, ?, ?, 'محجوز', CURRENT_TIMESTAMP)`,
                     [payment.phone, payment.password || '1234', Number(payment.gigabytes), Number(payment.renewal_day || 7)]
                 );
                 targetBookingId = bookingResult.lastID;
