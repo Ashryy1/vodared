@@ -326,13 +326,14 @@ app.get('/api/owners', async (req, res) => {
                  ORDER BY b.id DESC`,
                 [o.id, o.phone]
             );
-            const totalGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
+            const assignedGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
             return {
                 ...o,
                 members,
                 members_count: members.length,
-                total_gigabytes: totalGigs,
-                package_gigabytes: o.total_gigabytes || totalGigs
+                assigned_gigabytes: assignedGigs,
+                package_gigabytes: o.total_gigabytes || assignedGigs,
+                total_gigabytes: o.total_gigabytes || assignedGigs
             };
         }));
         res.json({ success: true, data: ownersWithMembers });
@@ -391,7 +392,7 @@ app.post('/api/owners', async (req, res) => {
         const vfData = vf.details || {};
         const resolvedName = name || vfData.name || 'أونر فودافون';
         const resolvedPlan = vfData.currentPlan || null;
-        const resolvedRenewalDay = Number(renewal_day) || vfData.renewal_day || 11;
+        const resolvedRenewalDay = vfData.renewal_day || (renewal_day && Number(renewal_day) !== 7 ? Number(renewal_day) : 11);
         const resolvedTotalGB = vfData.total_gigabytes || 0;
 
         // 2. Save or update Owner
@@ -1328,6 +1329,7 @@ async function fastVodafoneCheck(msisdn, password) {
                 msisdn: clean,
                 "Accept-Language": "AR",
                 Accept: "application/json",
+                "Content-Type": "application/json",
                 Referer: "https://web.vodafone.com.eg/spa/familySharing",
             },
             signal: fController.signal,
@@ -1352,6 +1354,7 @@ async function fastVodafoneCheck(msisdn, password) {
 
                 const isOwner = (rm.type?.toLowerCase() === "owner") || (memberPhone === clean);
                 if (isOwner) continue;
+                if (rm.status !== "1") continue;
 
                 const mChars = rm.characteristic?.characteristicsValue || [];
                 const miChar = mChars.find((c) => c.characteristicName === "MI");
