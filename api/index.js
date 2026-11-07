@@ -1765,11 +1765,7 @@ function mainMenu(customUrl) {
     }
     return {
         inline_keyboard: [
-            [{ text: '🚀 فتح التطبيق / لوحة التحكم', web_app: { url } }],
-            [{ text: '🌐 فتح الويب سايت', url }],
-            [{ text: '📊 إدارة الحجوزات والأرقام', callback_data: 'm_bookings' }],
-            [{ text: '📅 سجلات التجديد (للتفعيل)', callback_data: 'm_renewals' }],
-            [{ text: '🔍 بحث عن خط', callback_data: 'm_search' }]
+            [{ text: '🚀 فتح التطبيق', web_app: { url } }]
         ]
     };
 }
