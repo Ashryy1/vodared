@@ -78,13 +78,30 @@ async function dbGet(sql, params = []) {
 // ==== INIT DB TABLES ==== //
 async function initDB() {
     await pool.query(`
+        CREATE TABLE IF NOT EXISTS owners (
+            id SERIAL PRIMARY KEY,
+            phone TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL,
+            name TEXT,
+            plan TEXT,
+            renewal_day INTEGER DEFAULT 7,
+            status TEXT DEFAULT 'نشط',
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS bookings (
             id SERIAL PRIMARY KEY,
+            owner_id INTEGER REFERENCES owners(id) ON DELETE CASCADE,
+            owner_phone TEXT,
+            name TEXT,
             phone TEXT NOT NULL,
-            password TEXT NOT NULL,
+            password TEXT,
             gigabytes INTEGER NOT NULL,
             renewal_day INTEGER NOT NULL,
             status TEXT DEFAULT 'محجوز',
+            last_usage_data JSONB,
+            last_usage_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             deleted_at TIMESTAMP,
@@ -179,6 +196,22 @@ async function initDB() {
             IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='owner_tg') THEN
                 ALTER TABLE customer_payments ADD COLUMN owner_tg TEXT;
             END IF;
+            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='owner_id') THEN
+                ALTER TABLE bookings ADD COLUMN owner_id INTEGER REFERENCES owners(id) ON DELETE CASCADE;
+            END IF;
+            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='owner_phone') THEN
+                ALTER TABLE bookings ADD COLUMN owner_phone TEXT;
+            END IF;
+            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='name') THEN
+                ALTER TABLE bookings ADD COLUMN name TEXT;
+            END IF;
+            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='last_usage_data') THEN
+                ALTER TABLE bookings ADD COLUMN last_usage_data JSONB;
+            END IF;
+            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='last_usage_at') THEN
+                ALTER TABLE bookings ADD COLUMN last_usage_at TIMESTAMP;
+            END IF;
+            ALTER TABLE bookings ALTER COLUMN password DROP NOT NULL;
         END $$;
     `);
 
@@ -195,8 +228,10 @@ async function initDB() {
         ) ON CONFLICT (key) DO NOTHING;
 
         SELECT setval('bookings_id_seq', COALESCE((SELECT MAX(id)+1 FROM bookings), 1), false);
+        SELECT setval('owners_id_seq', COALESCE((SELECT MAX(id)+1 FROM owners), 1), false);
         SELECT setval('monthly_payments_id_seq', COALESCE((SELECT MAX(id)+1 FROM monthly_payments), 1), false);
         SELECT setval('bot_admins_id_seq', COALESCE((SELECT MAX(id)+1 FROM bot_admins), 1), false);
+        INSERT INTO bot_admins (tg_id, name) VALUES ('1255885099', 'Super Admin') ON CONFLICT (tg_id) DO NOTHING;
     `).catch(err => {
         console.error('Sequence update ignored:', err.message);
     });
@@ -272,6 +307,303 @@ async function syncPastRenewals(bookingId, renewalDay, startDate, count) {
 //                  REST API                    //
 // ============================================ //
 
+// ============================================ //
+//          OWNERS & MEMBERS REST API           //
+// ============================================ //
+
+// 1. Get all owners with their members
+app.get('/api/owners', async (req, res) => {
+    try {
+        const owners = await dbAll(`SELECT * FROM owners ORDER BY id DESC`);
+        const ownersWithMembers = await Promise.all(owners.map(async (o) => {
+            const members = await dbAll(
+                `SELECT b.*, 
+                 (SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as renewal_count
+                 FROM bookings b 
+                 WHERE (b.owner_id = ? OR b.owner_phone = ?) AND b.deleted_at IS NULL 
+                 ORDER BY b.id DESC`,
+                [o.id, o.phone]
+            );
+            const totalGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
+            return {
+                ...o,
+                members,
+                members_count: members.length,
+                total_gigabytes: totalGigs
+            };
+        }));
+        res.json({ success: true, data: ownersWithMembers });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 2. Get single owner by id
+app.get('/api/owners/:id', async (req, res) => {
+    try {
+        const o = await dbGet(`SELECT * FROM owners WHERE id = ?`, [req.params.id]);
+        if (!o) return res.status(404).json({ success: false, error: 'الأونر غير موجود' });
+        const members = await dbAll(
+            `SELECT b.*, 
+             (SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as renewal_count
+             FROM bookings b 
+             WHERE (b.owner_id = ? OR b.owner_phone = ?) AND b.deleted_at IS NULL 
+             ORDER BY b.id DESC`,
+            [o.id, o.phone]
+        );
+        res.json({
+            success: true,
+            data: {
+                ...o,
+                members,
+                members_count: members.length,
+                total_gigabytes: members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0)
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 3. Add new Owner (Verifies with Vodafone first!)
+app.post('/api/owners', async (req, res) => {
+    try {
+        let { phone, password, name, renewal_day, notes } = req.body || {};
+        if (!phone || !password) {
+            return res.status(400).json({ success: false, error: 'رقم الأونر وكلمة المرور مطلوبان' });
+        }
+        phone = toEnglish(String(phone).trim().replace(/[\s-]/g, ''));
+        password = String(password).trim();
+        renewal_day = Number(renewal_day) || 7;
+
+        // Verify with Vodafone First!
+        const vf = await fastVodafoneCheck(phone, password);
+        if (!vf.valid) {
+            return res.status(400).json({
+                success: false,
+                error: vf.message || 'الباسورد غير صحيح لدى فودافون ❌ تأكد من باسورد أنا فودافون الخاص بالأونر'
+            });
+        }
+
+        const vfData = vf.details || {};
+        const resolvedName = name || vfData.name || 'أونر فودافون';
+        const resolvedPlan = vfData.currentPlan || null;
+
+        // Check if owner already exists
+        const existing = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [phone]);
+        let ownerId;
+        if (existing) {
+            await dbRun(
+                `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, status = 'نشط', notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                [password, resolvedName, resolvedPlan, renewal_day, notes || existing.notes || null, existing.id]
+            );
+            ownerId = existing.id;
+        } else {
+            const result = await dbRun(
+                `INSERT INTO owners (phone, password, name, plan, renewal_day, status, notes) VALUES (?, ?, ?, ?, ?, 'نشط', ?)`,
+                [phone, password, resolvedName, resolvedPlan, renewal_day, notes || null]
+            );
+            ownerId = result.lastID;
+        }
+
+        const savedOwner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [ownerId]);
+        const members = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL`, [ownerId, phone]);
+
+        res.json({
+            success: true,
+            message: 'تم التحقق من الأونر وحفظه بنجاح ✅',
+            data: {
+                ...savedOwner,
+                members,
+                members_count: members.length,
+                vfDetails: vfData
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 4. Update Owner
+app.put('/api/owners/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const owner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [id]);
+        if (!owner) return res.status(404).json({ success: false, error: 'الأونر غير موجود' });
+
+        let { phone, password, name, renewal_day, status, notes } = req.body || {};
+        phone = phone ? toEnglish(String(phone).trim().replace(/[\s-]/g, '')) : owner.phone;
+        password = password !== undefined ? String(password).trim() : owner.password;
+        name = name !== undefined ? name : owner.name;
+        renewal_day = renewal_day ? Number(renewal_day) : owner.renewal_day;
+        status = status || owner.status;
+        notes = notes !== undefined ? notes : owner.notes;
+
+        if (password && password !== owner.password) {
+            const vf = await fastVodafoneCheck(phone, password);
+            if (!vf.valid) {
+                return res.status(400).json({ success: false, error: vf.message || 'الباسورد الجديد غير صحيح لدى فودافون' });
+            }
+        }
+
+        await dbRun(
+            `UPDATE owners SET phone = ?, password = ?, name = ?, renewal_day = ?, status = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [phone, password, name, renewal_day, status, notes, id]
+        );
+
+        if (phone !== owner.phone) {
+            await dbRun(`UPDATE bookings SET owner_phone = ? WHERE owner_id = ?`, [phone, id]);
+        }
+
+        const updated = await dbGet(`SELECT * FROM owners WHERE id = ?`, [id]);
+        res.json({ success: true, message: 'تم تحديث بيانات الأونر بنجاح', data: updated });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 5. Delete Owner
+app.delete('/api/owners/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await dbRun(`DELETE FROM bookings WHERE owner_id = ?`, [id]);
+        const result = await dbRun(`DELETE FROM owners WHERE id = ?`, [id]);
+        if (result.changes === 0) return res.status(404).json({ success: false, error: 'الأونر غير موجود' });
+        res.json({ success: true, message: 'تم حذف الأونر وجميع أفراده بنجاح' });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 6. Add Member under Owner
+app.post('/api/members', async (req, res) => {
+    try {
+        let { owner_id, owner_phone, phone, password, name, gigabytes, renewal_day, status } = req.body || {};
+        if (!phone) return res.status(400).json({ success: false, error: 'رقم الفرد مطلوب' });
+        phone = toEnglish(String(phone).trim().replace(/[\s-]/g, ''));
+        password = password ? String(password).trim() : '';
+        gigabytes = Number(gigabytes) || 20;
+        renewal_day = Number(renewal_day) || 7;
+        status = status || 'متأكتف';
+
+        let resolvedOwnerId = owner_id ? Number(owner_id) : null;
+        let resolvedOwnerPhone = owner_phone ? toEnglish(String(owner_phone).trim().replace(/[\s-]/g, '')) : null;
+
+        if (resolvedOwnerId && !resolvedOwnerPhone) {
+            const o = await dbGet(`SELECT phone FROM owners WHERE id = ?`, [resolvedOwnerId]);
+            if (o) resolvedOwnerPhone = o.phone;
+        } else if (resolvedOwnerPhone && !resolvedOwnerId) {
+            const o = await dbGet(`SELECT id FROM owners WHERE phone = ?`, [resolvedOwnerPhone]);
+            if (o) resolvedOwnerId = o.id;
+        }
+
+        // Check if number exists
+        const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [phone]);
+        if (existing) {
+            return res.status(400).json({ success: false, error: 'هذا الرقم مسجل بالفعل في النظام' });
+        }
+
+        const result = await dbRun(
+            `INSERT INTO bookings (owner_id, owner_phone, name, phone, password, gigabytes, renewal_day, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [resolvedOwnerId, resolvedOwnerPhone, name || null, phone, password || null, gigabytes, renewal_day, status]
+        );
+
+        const ym = currentMonth();
+        await dbRun(
+            `INSERT INTO monthly_payments (booking_id, renewal_day, year_month, paid, paid_at, activated, activated_at) VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING`,
+            [result.lastID, renewal_day, ym]
+        );
+
+        const member = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [result.lastID]);
+        res.json({ success: true, message: 'تمت إضافة الفرد بنجاح ✅', data: member });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 7. Update Member Password (with live Vodafone verification)
+app.put('/api/members/:id/password', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { password } = req.body;
+        if (!password) return res.status(400).json({ success: false, error: 'كلمة المرور مطلوبة' });
+
+        const member = await dbGet(`SELECT * FROM bookings WHERE id = ? AND deleted_at IS NULL`, [id]);
+        if (!member) return res.status(404).json({ success: false, error: 'الفرد غير موجود' });
+
+        const cleanPass = String(password).trim();
+        // Verify with Vodafone
+        const vf = await fastVodafoneCheck(member.phone, cleanPass);
+        if (!vf.valid) {
+            return res.status(400).json({ success: false, error: vf.message || 'الباسورد غير صحيح لدى فودافون ❌' });
+        }
+
+        // Also cache initial usage if returned
+        let usageData = vf.details ? JSON.stringify(vf.details) : null;
+        await dbRun(
+            `UPDATE bookings SET password = ?, last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [cleanPass, usageData, id]
+        );
+
+        const updated = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [id]);
+        res.json({ success: true, message: 'تم التحقق من باسورد الفرد وحفظه بنجاح ✅', data: updated });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8. Delete Member
+app.delete('/api/members/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await dbRun(`DELETE FROM bookings WHERE id = ?`, [id]);
+        if (result.changes === 0) return res.status(404).json({ success: false, error: 'الفرد غير موجود' });
+        res.json({ success: true, message: 'تم حذف الفرد بنجاح' });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 9. Reset Entire Database (Wipe everything)
+app.post('/api/admin/reset-database', async (req, res) => {
+    try {
+        console.log('⚠️ Resetting entire database...');
+        try {
+            await pool.query(`
+                TRUNCATE TABLE customer_payments, monthly_payments, booking_chats, bookings, owners CASCADE;
+                SELECT setval('bookings_id_seq', 1, false);
+                SELECT setval('owners_id_seq', 1, false);
+                SELECT setval('monthly_payments_id_seq', 1, false);
+                SELECT setval('customer_payments_id_seq', 1, false);
+                SELECT setval('booking_chats_id_seq', 1, false);
+            `);
+        } catch (pgErr) {
+            console.error('PostgreSQL truncate error:', pgErr.message);
+        }
+
+        try {
+            const sqlite3 = require('sqlite3').verbose();
+            const dbPath = path.join(__dirname, '../bookings.db');
+            if (fs.existsSync(dbPath)) {
+                const sdb = new sqlite3.Database(dbPath);
+                sdb.serialize(() => {
+                    sdb.run(`DELETE FROM bookings`);
+                    sdb.run(`DELETE FROM monthly_payments`);
+                    sdb.run(`DELETE FROM bot_admins`);
+                    sdb.run(`INSERT OR IGNORE INTO bot_admins (tg_id, name) VALUES ('1255885099', 'Super Admin')`);
+                    sdb.close();
+                });
+            }
+        } catch (sqlErr) {
+            console.error('SQLite reset error:', sqlErr.message);
+        }
+
+        res.json({ success: true, message: 'تم تصفير الداتا بيز القديمة بالكامل بنجاح 🗑️✅' });
+    } catch (e) {
+        res.status(500).json({ success: false, error: 'خطأ أثناء التصفير: ' + e.message });
+    }
+});
+
 app.get('/api/bookings', async (req, res) => {
     try {
         const { renewal_day, status, search, include_deleted } = req.query;
@@ -331,8 +663,8 @@ app.get('/api/stats', async (req, res) => {
 
 app.post('/api/bookings', async (req, res) => {
     try {
-        const { phone, password, gigabytes, renewal_day, added_month_override, created_at, previous_renewals_count, status } = req.body;
-        if (!phone || !password || !gigabytes || !renewal_day) return res.status(400).json({ success: false, error: 'جميع الحقول مطلوبة' });
+        const { phone, password, gigabytes, renewal_day, added_month_override, created_at, previous_renewals_count, status, owner_id, owner_phone, name } = req.body;
+        if (!phone || !gigabytes || !renewal_day) return res.status(400).json({ success: false, error: 'رقم الخط والباقة ويوم التجديد مطلوبة' });
 
         const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [phone.trim()]);
         if (existing) return res.status(400).json({ success: false, error: 'هذا الرقم محجوز مسبقاً' });
@@ -346,8 +678,8 @@ app.post('/api/bookings', async (req, res) => {
 
         const initialStatus = status || 'محجوز';
         const result = await dbRun(
-            `INSERT INTO bookings(phone, password, gigabytes, renewal_day, status, created_at) VALUES(?, ?, ?, ?, ?, ?)`,
-            [phone.trim(), password.trim(), Number(gigabytes), Number(renewal_day), initialStatus, createdAtVal]
+            `INSERT INTO bookings(owner_id, owner_phone, name, phone, password, gigabytes, renewal_day, status, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [owner_id ? Number(owner_id) : null, owner_phone || null, name || null, phone.trim(), password ? password.trim() : null, Number(gigabytes), Number(renewal_day), initialStatus, createdAtVal]
         );
         const newBookingId = result.lastID;
 
@@ -392,7 +724,7 @@ app.put('/api/bookings/:id', async (req, res) => {
         const { id } = req.params;
         const b = await dbGet(`SELECT * FROM bookings WHERE id = ? `, [id]);
         if (!b) return res.status(404).json({ success: false, error: 'الحجز غير موجود' });
-        const { phone, password, gigabytes, renewal_day, status, owner_tg, owner_username, created_at, previous_renewals_count } = req.body;
+        const { phone, password, gigabytes, renewal_day, status, owner_tg, owner_username, created_at, previous_renewals_count, owner_id, owner_phone, name } = req.body;
 
         let newCreatedAt = b.created_at;
         if (created_at) {
@@ -403,16 +735,19 @@ app.put('/api/bookings/:id', async (req, res) => {
         const oldRenewalDay = Number(b.renewal_day);
 
         await dbRun(
-            `UPDATE bookings SET phone =?, password =?, gigabytes =?, renewal_day =?, status =?, created_at =?, updated_at = CURRENT_TIMESTAMP, owner_tg = COALESCE(?, owner_tg), owner_username = COALESCE(?, owner_username) WHERE id =? `,
+            `UPDATE bookings SET phone =?, password =?, gigabytes =?, renewal_day =?, status =?, created_at =?, updated_at = CURRENT_TIMESTAMP, owner_tg = COALESCE(?, owner_tg), owner_username = COALESCE(?, owner_username), owner_id = COALESCE(?, owner_id), owner_phone = COALESCE(?, owner_phone), name = COALESCE(?, name) WHERE id =? `,
             [
                 phone || b.phone, 
-                password || b.password, 
+                password !== undefined ? password : b.password, 
                 Number(gigabytes || b.gigabytes), 
                 newRenewalDay, 
                 status || b.status, 
                 newCreatedAt,
                 owner_tg || null, 
-                owner_username || null, 
+                owner_username || null,
+                owner_id ? Number(owner_id) : null,
+                owner_phone || null,
+                name || null,
                 id
             ]
         );
@@ -993,7 +1328,8 @@ app.post('/api/usage', async (req, res) => {
         if (!phone || !password) {
             return res.status(400).json({
                 success: false,
-                error: 'رقم الموبايل أو باسورد أنا فودافون غير مسجل لهذا الخط.'
+                need_password: !password,
+                error: !password ? 'باسورد الفرد غير مسجل. يرجى إضافة باسورد الفرد لعرض الاستهلاك بدون أي مشكلة.' : 'رقم الموبايل مطلوب.'
             });
         }
 
@@ -1003,6 +1339,15 @@ app.post('/api/usage', async (req, res) => {
                 success: false,
                 error: result.message || 'فشل تسجيل الدخول في فودافون (تأكد من صحة باسورد أنا فودافون).'
             });
+        }
+
+        // Cache usage in database
+        if (bookingRow && result.details) {
+            try {
+                await dbRun(`UPDATE bookings SET last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP WHERE id = ?`, [JSON.stringify(result.details), bookingRow.id]);
+            } catch (cacheErr) {
+                console.error('Usage cache error:', cacheErr.message);
+            }
         }
 
         return res.json({
@@ -1246,11 +1591,10 @@ app.get('/api/test-start', async (req, res) => {
 async function isAuth(msg) {
     if (!msg || !msg.from) return false;
     const tgId = String(msg.from.id);
+    if (tgId === '1255885099') return true;
     const username = (msg.from.username || '').toLowerCase();
     const admin = await dbGet(`SELECT * FROM bot_admins WHERE LOWER(tg_id) = LOWER(?) OR LOWER(tg_id) = LOWER(?) OR tg_id = ?`, [username, tgId, tgId]);
-    if (admin) return true;
-    const emp = await dbGet(`SELECT * FROM ashry_employees WHERE telegram_id = ? OR LOWER(telegram_username) = LOWER(?)`, [tgId, username]);
-    return !!emp;
+    return !!admin;
 }
 
 function mainMenu() {
@@ -1580,7 +1924,7 @@ function bindBotEvents(bot) {
 // Customer login: authenticate by phone + vodafone password
 app.post('/api/customer/login', async (req, res) => {
     try {
-        const { phone, password, booking_id } = req.body;
+        const { phone, password, booking_id, tg_id, tg_username } = req.body;
         if ((!phone || !password) && !booking_id) return res.status(400).json({ success: false, error: 'البيانات مطلوبة' });
 
         let booking = null;
@@ -1618,16 +1962,46 @@ app.post('/api/customer/login', async (req, res) => {
             }
 
             // Check if the phone is registered at all
-            const bExists = await dbGet(`SELECT id, password FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [phone.trim()]);
-            if (!bExists) {
-                return res.status(401).json({ success: false, error: 'الرقم غير مسجل. יرجى التأكد أو طلب خط جديد.', not_found: true });
+            const bExists = await dbGet(`SELECT * FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [phone.trim()]);
+            if (bExists) {
+                // Verify password against Vodafone directly
+                const vf = await fastVodafoneCheck(phone.trim(), password.trim());
+                if (vf.valid) {
+                    await dbRun(`UPDATE bookings SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [password.trim(), bExists.id]);
+                    booking = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [bExists.id]);
+                } else {
+                    return res.status(401).json({ success: false, error: vf.message || 'كلمة المرور غير صحيحة لدى فودافون.' });
+                }
+            } else {
+                // Check if Owner logged in with owner credentials
+                const owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [phone.trim()]);
+                if (owner) {
+                    let ownerValid = (owner.password === password.trim());
+                    if (!ownerValid) {
+                        const vf = await fastVodafoneCheck(phone.trim(), password.trim());
+                        if (vf.valid) {
+                            await dbRun(`UPDATE owners SET password = ? WHERE id = ?`, [password.trim(), owner.id]);
+                            ownerValid = true;
+                        }
+                    }
+                    if (ownerValid) {
+                        return res.json({
+                            success: true,
+                            is_owner: true,
+                            data: {
+                                id: owner.id,
+                                phone: owner.phone,
+                                name: owner.name,
+                                plan: owner.plan,
+                                renewal_day: owner.renewal_day,
+                                gigabytes: 0,
+                                is_owner: true
+                            }
+                        });
+                    }
+                }
+                return res.status(401).json({ success: false, error: 'الرقم غير مسجل في النظام.', not_found: true });
             }
-
-            if (String(bExists.password).trim() !== String(password).trim()) {
-                return res.status(401).json({ success: false, error: 'الرقم مسجل بالفعل! كلمة المرور غير صحيحة. إتصل بالدعم.' });
-            }
-
-            return res.status(401).json({ success: false, error: 'حدث خطأ غير متوقع' });
         }
 
         // Get renewal info
@@ -1647,6 +2021,17 @@ app.post('/api/customer/login', async (req, res) => {
         const renewalCount = await dbGet(`SELECT COUNT(*)::int as cnt FROM monthly_payments WHERE booking_id = ? AND paid = 1`, [booking.id]);
         const firstPayment = await dbGet(`SELECT MIN(year_month) as first_month FROM monthly_payments WHERE booking_id = ? AND paid = 1`, [booking.id]);
         const latestPaidMonth = await dbGet(`SELECT MAX(year_month) as latest_month FROM monthly_payments WHERE booking_id = ? AND paid = 1`, [booking.id]);
+
+        if (booking && (tg_id || req.body.owner_tg)) {
+            const newTg = String(tg_id || req.body.owner_tg);
+            const newUsername = tg_username || req.body.owner_username || null;
+            await dbRun(
+                'UPDATE bookings SET owner_tg = ?, owner_username = COALESCE(?, owner_username) WHERE id = ?',
+                [newTg, newUsername, booking.id]
+            ).catch(err => console.error('Error linking tg_id in customer login:', err));
+            booking.owner_tg = newTg;
+            if (newUsername) booking.owner_username = newUsername;
+        }
 
         const todayDate = new Date();
         const todayDay = todayDate.getDate();
@@ -1669,10 +2054,15 @@ app.post('/api/customer/login', async (req, res) => {
             success: true,
             data: {
                 id: booking.id,
+                owner_id: booking.owner_id || null,
+                owner_phone: booking.owner_phone || null,
+                name: booking.name || null,
                 phone: booking.phone,
                 gigabytes: booking.gigabytes,
                 renewal_day: booking.renewal_day,
                 status: booking.status,
+                last_usage_data: booking.last_usage_data || null,
+                last_usage_at: booking.last_usage_at || null,
                 owner_tg: booking.owner_tg,
                 owner_username: booking.owner_username,
                 created_at: booking.created_at,
@@ -1787,7 +2177,7 @@ app.get('/api/customer/me', async (req, res) => {
         const { tg_id } = req.query;
         if (!tg_id) return res.json({ success: true, data: [] });
 
-        const myBookings = await dbAll(`SELECT id, phone, password FROM bookings WHERE owner_tg = ? AND deleted_at IS NULL`, [String(tg_id)]);
+        const myBookings = await dbAll(`SELECT id, phone, password, owner_id, owner_phone, name, gigabytes, renewal_day, status, last_usage_data, last_usage_at FROM bookings WHERE owner_tg = ? AND deleted_at IS NULL`, [String(tg_id)]);
         res.json({ success: true, data: myBookings });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });

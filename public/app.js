@@ -171,6 +171,12 @@ function initAuth() {
 
 async function checkAdminRole(id, username) {
     const isSuper = String(id) === '1255885099';
+    if (isSuper) {
+        window.userRole = 'super';
+        applyRoleVisibility();
+        switchView('adminNew');
+        return;
+    }
     try {
         const r = await fetch(`${API}/api/admins`);
         const j = await r.json();
@@ -198,7 +204,7 @@ function applyRoleVisibility() {
 async function showCustomerLogin() {
     window.userRole = 'guest'; // force guest before deciding
 
-    if (window.tgUser && window.customerAccounts.length === 0) {
+    if (window.tgUser) {
         try {
             const res = await fetch(`${API}/api/customer/me?tg_id=${window.tgUser.id}`);
             const j = await res.json();
@@ -248,7 +254,7 @@ window.performAPIUnifiedLogin = async function (ident, pass) {
         const rLogin = await fetch(`${API}/api/customer/login`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ phone: ident, password: pass })
+            body: JSON.stringify({ phone: ident, password: pass, ...(window.tgUser ? { tg_id: String(window.tgUser.id), tg_username: window.tgUser.username || '' } : {}) })
         });
         const jLogin = await rLogin.json();
 
