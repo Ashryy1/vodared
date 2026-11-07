@@ -2131,7 +2131,12 @@ app.post('/api/customer/login', async (req, res) => {
                 // Verify password against Vodafone directly
                 const vf = await fastVodafoneCheck(phone.trim(), password.trim());
                 if (vf.valid) {
-                    await dbRun(`UPDATE bookings SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [password.trim(), bExists.id]);
+                    const vfName = vf.details?.name || null;
+                    if (vfName) {
+                        await dbRun(`UPDATE bookings SET password = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [password.trim(), vfName, bExists.id]);
+                    } else {
+                        await dbRun(`UPDATE bookings SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [password.trim(), bExists.id]);
+                    }
                     booking = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [bExists.id]);
                 } else {
                     return res.status(401).json({ success: false, error: vf.message || 'كلمة المرور غير صحيحة لدى فودافون.' });
