@@ -77,8 +77,8 @@ async function dbGet(sql, params = []) {
 
 // ==== INIT DB TABLES ==== //
 async function initDB() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS owners (
+    const tableQueries = [
+        `CREATE TABLE IF NOT EXISTS owners (
             id SERIAL PRIMARY KEY,
             phone TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL,
@@ -90,52 +90,53 @@ async function initDB() {
             notes TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS bookings (
+        );`,
+        `CREATE TABLE IF NOT EXISTS bookings (
             id SERIAL PRIMARY KEY,
-            owner_id INTEGER REFERENCES owners(id) ON DELETE CASCADE,
+            owner_id INTEGER,
             owner_phone TEXT,
             name TEXT,
             phone TEXT NOT NULL,
             password TEXT,
-            gigabytes INTEGER NOT NULL,
-            renewal_day INTEGER NOT NULL,
+            gigabytes INTEGER NOT NULL DEFAULT 0,
+            renewal_day INTEGER NOT NULL DEFAULT 7,
             status TEXT DEFAULT 'محجوز',
             last_usage_data JSONB,
             last_usage_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             deleted_at TIMESTAMP,
-            owner_tg TEXT
-        );
-        CREATE TABLE IF NOT EXISTS monthly_payments (
+            owner_tg TEXT,
+            owner_username TEXT
+        );`,
+        `CREATE TABLE IF NOT EXISTS monthly_payments (
             id SERIAL PRIMARY KEY,
-            booking_id INTEGER REFERENCES bookings(id) ON DELETE CASCADE,
-            renewal_day INTEGER NOT NULL,
+            booking_id INTEGER,
+            renewal_day INTEGER NOT NULL DEFAULT 7,
             year_month TEXT NOT NULL,
             paid INTEGER DEFAULT 0,
             paid_at TIMESTAMP,
             activated INTEGER DEFAULT 0,
             activated_at TIMESTAMP,
             UNIQUE(booking_id, year_month)
-        );
-        CREATE TABLE IF NOT EXISTS bot_admins (
+        );`,
+        `CREATE TABLE IF NOT EXISTS bot_admins (
             id SERIAL PRIMARY KEY,
             tg_id TEXT UNIQUE NOT NULL,
             name TEXT
-        );
-        CREATE TABLE IF NOT EXISTS settings (
+        );`,
+        `CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        );
-        CREATE TABLE IF NOT EXISTS booking_chats (
+        );`,
+        `CREATE TABLE IF NOT EXISTS booking_chats (
             id SERIAL PRIMARY KEY,
-            booking_id INTEGER REFERENCES bookings(id) ON DELETE CASCADE,
+            booking_id INTEGER,
             sender TEXT,
             message TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS customer_payments (
+        );`,
+        `CREATE TABLE IF NOT EXISTS customer_payments (
             id SERIAL PRIMARY KEY,
             booking_id INTEGER,
             year_month TEXT NOT NULL,
@@ -153,96 +154,99 @@ async function initDB() {
             verification_attempts INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             verified_at TIMESTAMP,
-            notes TEXT
-        );
-    `);
+            notes TEXT,
+            sender_name TEXT,
+            reject_reason TEXT,
+            owner_tg TEXT
+        );`
+    ];
 
-    // Add columns to existing schema safely
-    await pool.query(`
-        DO $$
-        BEGIN
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='deleted_at') THEN
-                ALTER TABLE bookings ADD COLUMN deleted_at TIMESTAMP;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='owner_tg') THEN
-                ALTER TABLE bookings ADD COLUMN owner_tg TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='owner_username') THEN
-                ALTER TABLE bookings ADD COLUMN owner_username TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='screenshot_url') THEN
-                ALTER TABLE customer_payments ADD COLUMN screenshot_url TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='payment_type') THEN
-                ALTER TABLE customer_payments ADD COLUMN payment_type TEXT DEFAULT 'renewal';
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='phone') THEN
-                ALTER TABLE customer_payments ADD COLUMN phone TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='password') THEN
-                ALTER TABLE customer_payments ADD COLUMN password TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='gigabytes') THEN
-                ALTER TABLE customer_payments ADD COLUMN gigabytes INTEGER;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='renewal_day') THEN
-                ALTER TABLE customer_payments ADD COLUMN renewal_day INTEGER;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='sender_name') THEN
-                ALTER TABLE customer_payments ADD COLUMN sender_name TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='reject_reason') THEN
-                ALTER TABLE customer_payments ADD COLUMN reject_reason TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='owner_tg') THEN
-                ALTER TABLE customer_payments ADD COLUMN owner_tg TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='owners' and column_name='total_gigabytes') THEN
-                ALTER TABLE owners ADD COLUMN total_gigabytes INTEGER DEFAULT 0;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='owner_id') THEN
-                ALTER TABLE bookings ADD COLUMN owner_id INTEGER REFERENCES owners(id) ON DELETE CASCADE;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='owner_phone') THEN
-                ALTER TABLE bookings ADD COLUMN owner_phone TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='name') THEN
-                ALTER TABLE bookings ADD COLUMN name TEXT;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='last_usage_data') THEN
-                ALTER TABLE bookings ADD COLUMN last_usage_data JSONB;
-            END IF;
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='last_usage_at') THEN
-                ALTER TABLE bookings ADD COLUMN last_usage_at TIMESTAMP;
-            END IF;
-            ALTER TABLE bookings ALTER COLUMN password DROP NOT NULL;
-        END $$;
-    `);
+    for (const q of tableQueries) {
+        try {
+            await pool.query(q);
+        } catch (e) {
+            console.warn('Table create warning:', e.message);
+        }
+    }
 
-    // Reset sequences after migration to prevent primary key constraint errors
-    await pool.query(`
-        -- Data Migration: Ensure year_month is always padded (2026-9 -> 2026-09)
-        UPDATE monthly_payments SET year_month = substring(year_month from 1 for 5) || '0' || substring(year_month from 6) WHERE length(year_month) = 6 AND year_month LIKE '%-%';
-        UPDATE customer_payments SET year_month = substring(year_month from 1 for 5) || '0' || substring(year_month from 6) WHERE length(year_month) = 6 AND year_month LIKE '%-%';
+    // Add columns individually so NO failure cascades or aborts others
+    const columnQueries = [
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS plan TEXT;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS notes TEXT;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'نشط';`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;`,
 
-        -- Seed 6th month reminder template if not exists
-        INSERT INTO settings(key, value) VALUES (
-            'sixth_month_reminder_template', 
-            '"⚠️ *تنبيه دورة التجديد السادسة والأخيرة*\n\nعزيزي العميل،\nنحيطك علماً بأن باقة الخط {phone} قد وصلت إلى *الشهر السادس* (نهاية دورة الـ 6 شهور).\nهذا هو الشهر الأخير في دورتك الحالية.\nبعد انتهاء هذا الشهر، يمكنك اختيار الخروج من النظام أو تجديد دورة جديدة لمدة 6 شهور أخرى.\n\nلأي استفسار يرجى التواصل مع الدعم الفني."'
-        ) ON CONFLICT (key) DO NOTHING;
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_id INTEGER;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_phone TEXT;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS name TEXT;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS password TEXT;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS gigabytes INTEGER DEFAULT 0;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'محجوز';`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_tg TEXT;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_username TEXT;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS last_usage_data JSONB;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS last_usage_at TIMESTAMP;`,
+        `ALTER TABLE bookings ALTER COLUMN password DROP NOT NULL;`,
 
-        SELECT setval('bookings_id_seq', COALESCE((SELECT MAX(id)+1 FROM bookings), 1), false);
-        ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;
-        SELECT setval('owners_id_seq', COALESCE((SELECT MAX(id)+1 FROM owners), 1), false);
-        SELECT setval('monthly_payments_id_seq', COALESCE((SELECT MAX(id)+1 FROM monthly_payments), 1), false);
-        SELECT setval('bot_admins_id_seq', COALESCE((SELECT MAX(id)+1 FROM bot_admins), 1), false);
-        INSERT INTO bot_admins (tg_id, name) VALUES ('1255885099', 'Super Admin') ON CONFLICT (tg_id) DO NOTHING;
-    `).catch(err => {
-        console.error('Sequence update ignored:', err.message);
-    });
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS screenshot_url TEXT;`,
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'renewal';`,
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS phone TEXT;`,
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS password TEXT;`,
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS gigabytes INTEGER;`,
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS renewal_day INTEGER;`,
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS sender_name TEXT;`,
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS reject_reason TEXT;`,
+        `ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS owner_tg TEXT;`
+    ];
+
+    for (const q of columnQueries) {
+        try {
+            await pool.query(q);
+        } catch (e) {
+            // column might already exist or minor difference
+        }
+    }
+
+    try {
+        await pool.query(`INSERT INTO bot_admins (tg_id, name) VALUES ('1255885099', 'Super Admin') ON CONFLICT (tg_id) DO NOTHING;`);
+    } catch (_) {}
+
+    try {
+        await pool.query(`
+            INSERT INTO settings(key, value) VALUES (
+                'sixth_month_reminder_template', 
+                '"⚠️ *تنبيه دورة التجديد السادسة والأخيرة*\n\nعزيزي العميل،\nنحيطك علماً بأن باقة الخط {phone} قد وصلت إلى *الشهر السادس* (نهاية دورة الـ 6 شهور).\nهذا هو الشهر الأخير في دورتك الحالية.\nبعد انتهاء هذا الشهر، يمكنك اختيار الخروج من النظام أو تجديد دورة جديدة لمدة 6 شهور أخرى.\n\nلأي استفسار يرجى التواصل مع الدعم الفني."'
+            ) ON CONFLICT (key) DO NOTHING;
+        `);
+    } catch (_) {}
 }
-// Init DB purely async (won't block export but runs on first cold start)
-initDB().catch(e => console.error('DB Init Error:', e));
+
+let dbInitPromise = null;
+function ensureDB() {
+    if (!dbInitPromise) {
+        dbInitPromise = initDB().catch(err => {
+            console.error('ensureDB failed:', err);
+            dbInitPromise = null;
+        });
+    }
+    return dbInitPromise;
+}
+
+// Call on startup
+ensureDB();
+
+// Middleware to await DB initialization on all API requests
+app.use(async (req, res, next) => {
+    if (req.path.startsWith('/api')) {
+        await ensureDB();
+    }
+    next();
+});
 
 // ==== UTILS ==== //
 function currentMonth() {
@@ -399,20 +403,49 @@ app.post('/api/owners', async (req, res) => {
         const resolvedTotalGB = vfData.total_gigabytes || 0;
 
         // 2. Save or update Owner
+        try {
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS plan TEXT;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;').catch(() => {});
+            await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_id INTEGER;').catch(() => {});
+            await pool.query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_phone TEXT;').catch(() => {});
+        } catch (_) {}
+
         const existing = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [phone]);
         let ownerId;
-        if (existing) {
-            await dbRun(
-                `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, status = 'نشط', notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || existing.notes || null, existing.id]
-            );
-            ownerId = existing.id;
-        } else {
-            const result = await dbRun(
-                `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, status, notes) VALUES (?, ?, ?, ?, ?, ?, 'نشط', ?)`,
-                [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || null]
-            );
-            ownerId = result.lastID;
+        try {
+            if (existing) {
+                await dbRun(
+                    `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, status = 'نشط', notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || existing.notes || null, existing.id]
+                );
+                ownerId = existing.id;
+            } else {
+                const result = await dbRun(
+                    `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, status, notes) VALUES (?, ?, ?, ?, ?, ?, 'نشط', ?)`,
+                    [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || null]
+                );
+                ownerId = result.lastID;
+            }
+        } catch (dbErr) {
+            if (String(dbErr.message).includes('total_gigabytes') || String(dbErr.message).includes('column')) {
+                await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;').catch(() => {});
+                if (existing) {
+                    await dbRun(
+                        `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, status = 'نشط', notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || existing.notes || null, existing.id]
+                    );
+                    ownerId = existing.id;
+                } else {
+                    const result = await dbRun(
+                        `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, status, notes) VALUES (?, ?, ?, ?, ?, ?, 'نشط', ?)`,
+                        [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || null]
+                    );
+                    ownerId = result.lastID;
+                }
+            } else {
+                throw dbErr;
+            }
         }
 
         // 3. Auto-import all discovered Family Members (الأفراد) under this Owner!
@@ -644,11 +677,15 @@ app.get('/api/bookings', async (req, res) => {
     try {
         const { renewal_day, status, search, include_deleted } = req.query;
         let sql = `SELECT b.*, 
+            COALESCE(o.name, 'أونر فودافون') as owner_name,
+            COALESCE(b.owner_phone, o.phone) as owner_phone,
             (SELECT COUNT(id)::int FROM booking_chats WHERE booking_id = b.id) as chats_count,
-            (SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as renewal_count,
+            GREATEST(1, COALESCE((SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) + 1, 1)) as renewal_count,
             (SELECT MIN(mp.year_month) FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as first_paid_month,
             (SELECT MAX(mp.year_month) FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as latest_paid_month
-            FROM bookings b WHERE 1=1`;
+            FROM bookings b 
+            LEFT JOIN owners o ON b.owner_id = o.id
+            WHERE 1=1`;
         const params = [];
 
         if (!include_deleted) {
@@ -1721,13 +1758,18 @@ async function isAuth(msg) {
     return !!admin;
 }
 
-function mainMenu() {
+function mainMenu(customUrl) {
+    let url = (customUrl || process.env.WEBAPP_URL || 'https://vodared.vercel.app').trim();
+    if (!url.startsWith('https://')) {
+        url = 'https://' + url.replace(/^http:\/\//, '');
+    }
     return {
         inline_keyboard: [
-            [{ text: '📋 إجمالي الطلبات', callback_data: 'm_bookings' }],
+            [{ text: '🚀 فتح التطبيق / لوحة التحكم', web_app: { url } }],
+            [{ text: '🌐 فتح الويب سايت', url }],
+            [{ text: '📊 إدارة الحجوزات والأرقام', callback_data: 'm_bookings' }],
             [{ text: '📅 سجلات التجديد (للتفعيل)', callback_data: 'm_renewals' }],
-            [{ text: '📈 إنجازات هذا الشهر (التنشيطات)', callback_data: 'm_achievements' }],
-            [{ text: '🔍 بحث عن طلب', callback_data: 'm_search' }]
+            [{ text: '🔍 بحث عن خط', callback_data: 'm_search' }]
         ]
     };
 }
@@ -1767,15 +1809,14 @@ app.post('/api/webhook', async (req, res) => {
             if (text.startsWith('/start')) {
                 try {
                     const isAdmin = await isAuth(req.body.message);
+                    let webAppUrl = (process.env.WEBAPP_URL || 'https://vodared.vercel.app').trim();
+                    if (!webAppUrl.startsWith('https://')) {
+                        webAppUrl = 'https://' + webAppUrl.replace(/^http:\/\//, '');
+                    }
 
                     if (isAdmin) {
-                        await botInstance.sendMessage(chatId, `👋 مرحباً بك في لوحة الموظفين.\nاختر من القائمة:`, { parse_mode: 'Markdown', reply_markup: mainMenu() });
+                        await botInstance.sendMessage(chatId, `👑 *مرحباً بك يا أونر في نظام فودافون ريد 🚀*\n\nاضغط على الزر أدناه لفتح لوحة التحكم والتطبيق ومتابعة الخطوط والأفراد:`, { parse_mode: 'Markdown', reply_markup: mainMenu(webAppUrl) });
                     } else {
-                        // Customer Logic
-                        let webAppUrl = (process.env.WEBAPP_URL || 'https://vodared.vercel.app').trim();
-                        if (!webAppUrl.startsWith('https://')) {
-                            webAppUrl = 'https://' + webAppUrl.replace(/^http:\/\//, '');
-                        }
                         const myBookings = await dbAll(`SELECT * FROM bookings WHERE owner_tg = ? AND deleted_at IS NULL`, [String(chatId)]);
 
                         if (myBookings.length > 0) {
@@ -1818,11 +1859,14 @@ function bindBotEvents(bot) {
     bot.onText(/\/start/, async (msg) => {
         try {
             const isAdmin = await isAuth(msg);
-            if (isAdmin) {
-                return bot.sendMessage(msg.chat.id, `👋 مرحباً بك في لوحة الموظفين.\nاختر من القائمة:`, { parse_mode: 'Markdown', reply_markup: mainMenu() });
+            let webAppUrl = (process.env.WEBAPP_URL || 'https://vodared.vercel.app').trim();
+            if (!webAppUrl.startsWith('https://')) {
+                webAppUrl = 'https://' + webAppUrl.replace(/^http:\/\//, '');
             }
 
-            const webAppUrl = process.env.WEBAPP_URL || 'https://vodared.vercel.app';
+            if (isAdmin) {
+                return bot.sendMessage(msg.chat.id, `👑 *مرحباً بك يا أونر في نظام فودافون ريد 🚀*\n\nاضغط على الزر أدناه لفتح لوحة التحكم والتطبيق ومتابعة الخطوط والأفراد:`, { parse_mode: 'Markdown', reply_markup: mainMenu(webAppUrl) });
+            }
             const tgId = String(msg.chat.id);
             const myBookings = await dbAll(`SELECT * FROM bookings WHERE owner_tg = ? AND deleted_at IS NULL`, [tgId]);
 
