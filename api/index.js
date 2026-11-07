@@ -229,14 +229,7 @@ async function initDB() {
         ) ON CONFLICT (key) DO NOTHING;
 
         SELECT setval('bookings_id_seq', COALESCE((SELECT MAX(id)+1 FROM bookings), 1), false);
-        
-        DO $ 
-        BEGIN 
-            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='owners' and column_name='total_gigabytes') THEN
-                ALTER TABLE owners ADD COLUMN total_gigabytes INTEGER DEFAULT 0;
-            END IF;
-        END $;
-    
+        ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;
         SELECT setval('owners_id_seq', COALESCE((SELECT MAX(id)+1 FROM owners), 1), false);
         SELECT setval('monthly_payments_id_seq', COALESCE((SELECT MAX(id)+1 FROM monthly_payments), 1), false);
         SELECT setval('bot_admins_id_seq', COALESCE((SELECT MAX(id)+1 FROM bot_admins), 1), false);
