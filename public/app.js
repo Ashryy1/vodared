@@ -768,19 +768,6 @@ async function renderCustomerDashboard() {
         </div>
     </div>
     
-    <div class="developer-footer" style="margin: 40px auto 20px auto; padding-bottom: 20px; text-align: center; max-width: 400px; font-family: 'Inter', sans-serif;">
-        <div style="display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 12px; opacity: 0.7;">
-            <div style="height: 1px; flex: 1; background: linear-gradient(to right, transparent, rgba(255,255,255,0.15));"></div>
-            <span style="color: #888; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2.5px;">Designed & Developed by</span>
-            <div style="height: 1px; flex: 1; background: linear-gradient(to left, transparent, rgba(255,255,255,0.15));"></div>
-        </div>
-        <div style="color: #e0e0e0; font-size: 1.15rem; font-weight: 500; letter-spacing: 1px; margin-bottom: 15px;">Hossam Ashour</div>
-        <div style="display: flex; justify-content: center; gap: 24px;">
-            <a href="https://www.facebook.com/share/19EWBmqJKF/" target="_blank" style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;" onmouseover="this.style.color='#1877F2'" onmouseout="this.style.color='#555'"><i class='bx bxl-facebook'></i></a>
-            <a href="https://www.instagram.com/hossam_ashourr?igsi=MXd3aG9henhrb2g3ZQ==" target="_blank" style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;" onmouseover="this.style.color='#E4405F'" onmouseout="this.style.color='#555'"><i class='bx bxl-instagram'></i></a>
-            <a href="https://wa.me/201101925305" target="_blank" style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;" onmouseover="this.style.color='#25D366'" onmouseout="this.style.color='#555'"><i class='bx bxl-whatsapp'></i></a>
-            <a href="https://t.me/hossam_ashourr" target="_blank" style="color: #555; text-decoration: none; font-size: 1.3rem; transition: color 0.3s;" onmouseover="this.style.color='#0088cc'" onmouseout="this.style.color='#555'"><i class='bx bxl-telegram'></i></a>
-        </div>
     </div>`;
 
     list.innerHTML = html;
@@ -2373,39 +2360,7 @@ function renderPendingPayments() {
 
 
 
-// Add Developer Footer
-const footerHtml = `
-<div class="developer-footer"
-    style="position: relative; z-index: 10; width: 100%; max-width: 400px; margin: 40px auto; padding: 24px; background: linear-gradient(145deg, rgba(20,20,22,0.8), rgba(10,10,12,0.9)); border-radius: 24px; border: 1px solid rgba(255,255,255,0.06); text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.4); animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards; opacity: 0; transform: translateY(30px); animation-delay: 0.1s;">
-    <div style="font-size: 0.85rem; color: #8e8e93; margin-bottom: 8px; letter-spacing: 0.5px; font-weight: 500;">
-        Made with by</div>
-    <div
-        style="font-size: 1.25rem; font-weight: 900; background: linear-gradient(to right, #fff, #aaa); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 18px; letter-spacing: 1px;">
-        Hossam Ashour</div>
-    <div style="display: flex; justify-content: center; gap: 16px;">
-        <a href="https://www.facebook.com/share/19EWBmqJKF/" target="_blank"
-            style="color: #1877F2; text-decoration: none; width: 44px; height: 44px; background: rgba(24, 119, 242, 0.08); border: 1px solid rgba(24, 119, 242, 0.2); border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: all 0.3s;"
-            onmouseover="this.style.transform='translateY(-3px)'; this.style.background='rgba(24, 119, 242, 0.15)'"
-            onmouseout="this.style.transform='translateY(0)'; this.style.background='rgba(24, 119, 242, 0.08)'"><i
-                class='bx bxl-facebook' style="font-size: 1.4rem;"></i></a>
-        <a href="https://www.instagram.com/hossam_ashourr?igsi=MXd3aG9henhrb2g3ZQ==" target="_blank"
-            style="color: #E4405F; text-decoration: none; width: 44px; height: 44px; background: rgba(228, 64, 95, 0.08); border: 1px solid rgba(228, 64, 95, 0.2); border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: all 0.3s;"
-            onmouseover="this.style.transform='translateY(-3px)'; this.style.background='rgba(228, 64, 95, 0.15)'"
-            onmouseout="this.style.transform='translateY(0)'; this.style.background='rgba(228, 64, 95, 0.08)'"><i
-                class='bx bxl-instagram' style="font-size: 1.4rem;"></i></a>
-        <a href="https://wa.me/201101925305" target="_blank"
-            style="color: #25D366; text-decoration: none; width: 44px; height: 44px; background: rgba(37, 211, 102, 0.08); border: 1px solid rgba(37, 211, 102, 0.2); border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: all 0.3s;"
-            onmouseover="this.style.transform='translateY(-3px)'; this.style.background='rgba(37, 211, 102, 0.15)'"
-            onmouseout="this.style.transform='translateY(0)'; this.style.background='rgba(37, 211, 102, 0.08)'"><i
-                class='bx bxl-whatsapp' style="font-size: 1.4rem;"></i></a>
-        <a href="https://t.me/hossam_ashourr" target="_blank"
-            style="color: #0088cc; text-decoration: none; width: 44px; height: 44px; background: rgba(0, 136, 204, 0.08); border: 1px solid rgba(0, 136, 204, 0.2); border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: all 0.3s;"
-            onmouseover="this.style.transform='translateY(-3px)'; this.style.background='rgba(0, 136, 204, 0.15)'"
-            onmouseout="this.style.transform='translateY(0)'; this.style.background='rgba(0, 136, 204, 0.08)'"><i
-                class='bx bxl-telegram' style="font-size: 1.4rem;"></i></a>
-    </div>
-</div>`;
-document.body.insertAdjacentHTML('beforeend', footerHtml);
+
 
 function getTimeAgo(date) {
     const now = new Date();

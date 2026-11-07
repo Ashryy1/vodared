@@ -197,6 +197,9 @@ async function initDB() {
             IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='customer_payments' and column_name='owner_tg') THEN
                 ALTER TABLE customer_payments ADD COLUMN owner_tg TEXT;
             END IF;
+            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='owners' and column_name='total_gigabytes') THEN
+                ALTER TABLE owners ADD COLUMN total_gigabytes INTEGER DEFAULT 0;
+            END IF;
             IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='bookings' and column_name='owner_id') THEN
                 ALTER TABLE bookings ADD COLUMN owner_id INTEGER REFERENCES owners(id) ON DELETE CASCADE;
             END IF;
@@ -570,11 +573,12 @@ app.put('/api/members/:id/password', async (req, res) => {
             return res.status(400).json({ success: false, error: vf.message || 'الباسورد غير صحيح لدى فودافون ❌' });
         }
 
-        // Also cache initial usage if returned
+        // Also cache initial usage and extract subscriber name from Vodafone
         let usageData = vf.details ? JSON.stringify(vf.details) : null;
+        let memberName = vf.details?.name || null;
         await dbRun(
-            `UPDATE bookings SET password = ?, last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-            [cleanPass, usageData, id]
+            `UPDATE bookings SET password = ?, name = COALESCE(?, name), last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [cleanPass, memberName, usageData, id]
         );
 
         const updated = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [id]);
@@ -1460,10 +1464,11 @@ app.post('/api/usage', async (req, res) => {
             });
         }
 
-        // Cache usage in database
+        // Cache usage and subscriber name in database
         if (bookingRow && result.details) {
             try {
-                await dbRun(`UPDATE bookings SET last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP WHERE id = ?`, [JSON.stringify(result.details), bookingRow.id]);
+                const memberName = result.details.name || null;
+                await dbRun(`UPDATE bookings SET name = COALESCE(?, name), last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP WHERE id = ?`, [memberName, JSON.stringify(result.details), bookingRow.id]);
             } catch (cacheErr) {
                 console.error('Usage cache error:', cacheErr.message);
             }
