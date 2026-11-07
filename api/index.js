@@ -85,6 +85,7 @@ async function initDB() {
             name TEXT,
             plan TEXT,
             renewal_day INTEGER DEFAULT 7,
+            total_gigabytes INTEGER DEFAULT 0,
             status TEXT DEFAULT 'نشط',
             notes TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -228,6 +229,14 @@ async function initDB() {
         ) ON CONFLICT (key) DO NOTHING;
 
         SELECT setval('bookings_id_seq', COALESCE((SELECT MAX(id)+1 FROM bookings), 1), false);
+        
+        DO $ 
+        BEGIN 
+            IF NOT EXISTS(SELECT * FROM information_schema.columns WHERE table_name='owners' and column_name='total_gigabytes') THEN
+                ALTER TABLE owners ADD COLUMN total_gigabytes INTEGER DEFAULT 0;
+            END IF;
+        END $;
+    
         SELECT setval('owners_id_seq', COALESCE((SELECT MAX(id)+1 FROM owners), 1), false);
         SELECT setval('monthly_payments_id_seq', COALESCE((SELECT MAX(id)+1 FROM monthly_payments), 1), false);
         SELECT setval('bot_admins_id_seq', COALESCE((SELECT MAX(id)+1 FROM bot_admins), 1), false);
@@ -329,7 +338,8 @@ app.get('/api/owners', async (req, res) => {
                 ...o,
                 members,
                 members_count: members.length,
-                total_gigabytes: totalGigs
+                total_gigabytes: totalGigs,
+                package_gigabytes: o.total_gigabytes || totalGigs
             };
         }));
         res.json({ success: true, data: ownersWithMembers });
@@ -376,7 +386,7 @@ app.post('/api/owners', async (req, res) => {
         password = String(password).trim();
         renewal_day = Number(renewal_day) || 7;
 
-        // Verify with Vodafone First!
+        // 1. Verify with Vodafone First!
         const vf = await fastVodafoneCheck(phone, password);
         if (!vf.valid) {
             return res.status(400).json({
@@ -388,34 +398,62 @@ app.post('/api/owners', async (req, res) => {
         const vfData = vf.details || {};
         const resolvedName = name || vfData.name || 'أونر فودافون';
         const resolvedPlan = vfData.currentPlan || null;
+        const resolvedRenewalDay = Number(renewal_day) || vfData.renewal_day || 11;
+        const resolvedTotalGB = vfData.total_gigabytes || 0;
 
-        // Check if owner already exists
+        // 2. Save or update Owner
         const existing = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [phone]);
         let ownerId;
         if (existing) {
             await dbRun(
-                `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, status = 'نشط', notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                [password, resolvedName, resolvedPlan, renewal_day, notes || existing.notes || null, existing.id]
+                `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, status = 'نشط', notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || existing.notes || null, existing.id]
             );
             ownerId = existing.id;
         } else {
             const result = await dbRun(
-                `INSERT INTO owners (phone, password, name, plan, renewal_day, status, notes) VALUES (?, ?, ?, ?, ?, 'نشط', ?)`,
-                [phone, password, resolvedName, resolvedPlan, renewal_day, notes || null]
+                `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, status, notes) VALUES (?, ?, ?, ?, ?, ?, 'نشط', ?)`,
+                [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || null]
             );
             ownerId = result.lastID;
         }
 
+        // 3. Auto-import all discovered Family Members (الأفراد) under this Owner!
+        const autoImported = [];
+        if (Array.isArray(vfData.familyMembers) && vfData.familyMembers.length > 0) {
+            for (const m of vfData.familyMembers) {
+                if (!m.phone) continue;
+                const mGigs = m.gigabytes || 20;
+                const existingMember = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [m.phone]);
+                if (existingMember) {
+                    await dbRun(
+                        `UPDATE bookings SET owner_id = ?, owner_phone = ?, gigabytes = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [ownerId, phone, mGigs, resolvedRenewalDay, existingMember.id]
+                    );
+                    autoImported.push(m.phone);
+                } else {
+                    await dbRun(
+                        `INSERT INTO bookings (owner_id, owner_phone, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                        [ownerId, phone, m.phone, mGigs, resolvedRenewalDay, `فرد (${m.phone.slice(-4)})`]
+                    );
+                    autoImported.push(m.phone);
+                }
+            }
+        }
+
         const savedOwner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [ownerId]);
-        const members = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL`, [ownerId, phone]);
+        const members = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [ownerId, phone]);
 
         res.json({
             success: true,
-            message: 'تم التحقق من الأونر وحفظه بنجاح ✅',
+            message: autoImported.length > 0 
+                ? `تم التحقق من الأونر واستيراد ${autoImported.length} أفراد تلقائياً بنجاح! 🎉`
+                : 'تم التحقق من الأونر وحفظه بنجاح ✅',
             data: {
                 ...savedOwner,
                 members,
                 members_count: members.length,
+                auto_imported_count: autoImported.length,
                 vfDetails: vfData
             }
         });
@@ -1282,7 +1320,89 @@ async function fastVodafoneCheck(msisdn, password) {
         console.error("Usage fetch warning:", err.message);
     }
 
+    // 5. Fetch Family Customer Group (for Red Owners)
+    let familyMembers = [];
+    let familyTotalMI = 0;
+    try {
+        const familyUrl = "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup?type=Family";
+        const fController = new AbortController();
+        const fTimeout = setTimeout(() => fController.abort(), 10000);
+        const fRes = await fetch(familyUrl, {
+            headers: {
+                "User-Agent": ua,
+                Authorization: `Bearer ${accessToken}`,
+                clientId: "WebsiteConsumer",
+                msisdn: clean,
+                "Accept-Language": "AR",
+                Accept: "application/json",
+                Referer: "https://web.vodafone.com.eg/spa/familySharing",
+            },
+            signal: fController.signal,
+        });
+        clearTimeout(fTimeout);
+        if (fRes.ok) {
+            const fData = await fRes.json();
+            const group0 = Array.isArray(fData) ? fData[0] : fData;
+            const parts = group0?.parts || {};
+            const chars = parts.characteristicsValue?.characteristicsValue || [];
+            const totalMIChar = chars.find((c) => c.characteristicName === "totalMI");
+            if (totalMIChar && totalMIChar.value) {
+                familyTotalMI = Number(totalMIChar.value);
+            }
+
+            const rawMembers = parts.member || [];
+            for (const rm of rawMembers) {
+                const idVal = rm.id?.[0]?.value || "";
+                let memberPhone = idVal.replace(/[\s-]/g, "");
+                if (memberPhone.startsWith("201")) memberPhone = memberPhone.substring(1);
+                else if (memberPhone.startsWith("+201")) memberPhone = memberPhone.substring(3);
+
+                const isOwner = (rm.type?.toLowerCase() === "owner") || (memberPhone === clean);
+                if (isOwner) continue;
+
+                const mChars = rm.characteristic?.characteristicsValue || [];
+                const miChar = mChars.find((c) => c.characteristicName === "MI");
+                const voiceChar = mChars.find((c) => c.characteristicName === "Voice");
+                const smsChar = mChars.find((c) => c.characteristicName === "SMS");
+
+                const miMB = miChar ? Number(miChar.value) : 0;
+                const miGB = miMB > 0 ? Math.round(miMB / 1024) : 0;
+
+                familyMembers.push({
+                    phone: memberPhone,
+                    type: rm.type || "Member",
+                    status: rm.status === "1" ? "active" : "inactive",
+                    gigabytes: miGB,
+                    megabytes: miMB,
+                    voice: voiceChar ? Number(voiceChar.value) : 0,
+                    sms: smsChar ? Number(smsChar.value) : 0,
+                });
+            }
+        }
+    } catch (fErr) {
+        console.error("Family group fetch warning:", fErr.message);
+    }
+
     const tariffItem = quotaItems.find((i) => i.entryType?.toLowerCase() === "tariff" || i.usageType?.toLowerCase() === "tariff");
+
+    let renewalDay = null;
+    if (userInfo?.billCycleCode && !isNaN(parseInt(userInfo.billCycleCode, 10))) {
+        renewalDay = parseInt(userInfo.billCycleCode, 10);
+    } else if (renewableDate) {
+        renewalDay = new Date(renewableDate).getDate();
+    }
+
+    let totalGB = 0;
+    if (familyTotalMI > 0) {
+        totalGB = Math.round(familyTotalMI / 1024);
+    } else {
+        const dataItem = quotaSummary.find((q) => q.key === "data");
+        if (dataItem && dataItem.total) {
+            totalGB = Math.round(dataItem.total / 1024);
+        } else if (tariffItem && tariffItem.total) {
+            totalGB = Math.round((tariffItem.total || 0) / 1024);
+        }
+    }
 
     const data = {
         name: userInfo ? `${userInfo.firstName || ""} ${userInfo.lastName || ""}`.trim() : null,
@@ -1294,6 +1414,9 @@ async function fastVodafoneCheck(msisdn, password) {
         loyaltyStatus: userInfo?.isLoyalAuthorized === "Y" ? "مؤهل" : "غير مؤهل",
         balance: tariffItem ? String(tariffItem.remaining ?? "") : null,
         renewableDate,
+        renewal_day: renewalDay,
+        total_gigabytes: totalGB,
+        familyMembers,
         quotaSummary,
         quotaItems,
         rawUserInfo: userInfo,
