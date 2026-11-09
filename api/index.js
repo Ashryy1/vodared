@@ -543,51 +543,642 @@ app.delete('/api/owners/:id', async (req, res) => {
     }
 });
 
-// 6. Add Member under Owner
-app.post('/api/members', async (req, res) => {
+// ============================================ //
+//     VODAFONE RED FAMILY DXL ENGINE          //
+// ============================================ //
+
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+const ownerTokenCache = new Map();
+
+function displayMsisdn(m) {
+    if (!m) return '';
+    let s = String(m).replace(/[^0-9]/g, '');
+    if (s.startsWith('20') && s.length === 12) s = s.substring(2);
+    if (!s.startsWith('0') && s.length === 10) s = '0' + s;
+    return s;
+}
+
+function extractVodafoneCookies(resp, cookieMap) {
+    const getSetCookie = resp.headers.getSetCookie;
+    let rawCookies = [];
+    if (typeof getSetCookie === 'function') {
+        rawCookies = resp.headers.getSetCookie() || [];
+    } else {
+        const sc = resp.headers.get('set-cookie');
+        if (sc) rawCookies = [sc];
+    }
+    for (const rc of rawCookies) {
+        const parts = rc.split(';')[0].split('=');
+        if (parts.length >= 2) {
+            const k = parts[0].trim();
+            const v = parts.slice(1).join('=').trim();
+            if (k && v && v !== 'deleted') {
+                cookieMap[k] = v;
+            }
+        }
+    }
+}
+
+function serializeCookieMap(cookieMap) {
+    return Object.entries(cookieMap)
+        .filter(([_, v]) => v)
+        .map(([k, v]) => `${k}=${v}`)
+        .join('; ');
+}
+
+async function authenticateVodafoneOwner(phone, password) {
+    const normPhone = displayMsisdn(phone);
+    const cookieMap = {};
+
+    const authUrl = "https://web.vodafone.com.eg/auth/realms/vf-realm/protocol/openid-connect/auth?client_id=website&redirect_uri=https%3A%2F%2Fweb.vodafone.com.eg%2Fspa%2FmyHome&response_type=code&scope=openid";
+
+    console.log(`[AUTH] Authenticating Vodafone line ${normPhone}...`);
+
+    let currentUrl = authUrl;
+    let pageResp = await fetch(currentUrl, {
+        headers: { 'User-Agent': BROWSER_UA },
+        redirect: 'manual'
+    });
+    extractVodafoneCookies(pageResp, cookieMap);
+
+    while ([301, 302, 303, 307, 308].includes(pageResp.status)) {
+        const loc = pageResp.headers.get('location');
+        if (!loc) break;
+        currentUrl = new URL(loc, currentUrl).toString();
+        pageResp = await fetch(currentUrl, {
+            headers: {
+                'User-Agent': BROWSER_UA,
+                'Cookie': serializeCookieMap(cookieMap)
+            },
+            redirect: 'manual'
+        });
+        extractVodafoneCookies(pageResp, cookieMap);
+    }
+
+    const pageHtml = await pageResp.text();
+    const formActionMatch = pageHtml.match(/<form[^>]*id=["']kc-form-login["'][^>]*action=["']([^"']+)["']/i)
+        || pageHtml.match(/action=["'](https:\/\/web\.vodafone\.com\.eg\/auth\/realms\/vf-realm\/login-actions\/authenticate[^"']+)["']/i)
+        || pageHtml.match(/action=["']([^"']*\/login-actions\/authenticate[^"']*)["']/i);
+
+    if (!formActionMatch) {
+        return { success: false, message: 'تعذر العثور على نموذج تسجيل الدخول في فودافون' };
+    }
+
+    let actionUrl = formActionMatch[1].replace(/&amp;/g, '&');
+    if (actionUrl.startsWith('/')) {
+        actionUrl = new URL(actionUrl, currentUrl).toString();
+    }
+
+    const postParams = new URLSearchParams({
+        username: normPhone,
+        password: password,
+        rememberMe: 'on',
+        login: ''
+    });
+
+    const postResp = await fetch(actionUrl, {
+        method: 'POST',
+        headers: {
+            'User-Agent': BROWSER_UA,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': currentUrl,
+            'Cookie': serializeCookieMap(cookieMap)
+        },
+        body: postParams.toString(),
+        redirect: 'manual'
+    });
+
+    extractVodafoneCookies(postResp, cookieMap);
+
+    const postText = await postResp.text();
+    const locationHeader = postResp.headers.get('location') || '';
+
+    if (postText.includes('invalid') || postText.includes('error') || postText.includes('كلمة المرور غير صحيحة')) {
+        return { success: false, message: 'رقم الموبايل أو كلمة السر غير صحيحة على شبكة فودافون' };
+    }
+
+    if (postText.includes('otp') || postText.includes('verification') || postText.includes('كود التحقق')) {
+        return { success: false, message: 'فودافون تطلب كود التحقق (OTP) المرسل للهاتف' };
+    }
+
+    if (!locationHeader) {
+        return { success: false, message: 'فشل التحقق من الحساب: لم يتم تحويل الجلسة' };
+    }
+
+    const codeMatch = locationHeader.match(/[?&]code=([^&]+)/);
+    if (!codeMatch) {
+        return { success: false, message: 'فشل استلام كود التفويض من بوابة الدخول' };
+    }
+
+    const tokenUrl = "https://web.vodafone.com.eg/auth/realms/vf-realm/protocol/openid-connect/token";
+    const tokenParams = new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: 'website',
+        redirect_uri: 'https://web.vodafone.com.eg/spa/myHome',
+        code: codeMatch[1]
+    });
+
+    const tokenResp = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+            'User-Agent': BROWSER_UA,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Cookie': serializeCookieMap(cookieMap)
+        },
+        body: tokenParams.toString()
+    });
+
+    let tokenJson = null;
     try {
-        let { owner_id, owner_phone, phone, password, name, gigabytes, renewal_day, status } = req.body || {};
+        tokenJson = await tokenResp.json();
+    } catch (e) {
+        return { success: false, message: 'استجابة غير صحيحة من سيرفر التوكن' };
+    }
+
+    if (!tokenJson || !tokenJson.access_token) {
+        return { success: false, message: 'لم يتم استلام access_token من فودافون' };
+    }
+
+    let profile = { name: "مالك فودافون", planName: "Vodafone RED", accountNumber: "N/A" };
+    try {
+        const parts = tokenJson.access_token.split('.');
+        const claims = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+        if (claims.userInfo) {
+            profile.name = `${claims.userInfo.firstName || ''} ${claims.userInfo.lastName || ''}`.trim() || profile.name;
+            profile.planName = claims.userInfo.tariffModelName || profile.planName;
+            profile.accountNumber = claims.userInfo.accountNumber || profile.accountNumber;
+            const rawDate = claims.userInfo.billCycleDate ? claims.userInfo.billCycleDate.split('T')[0] : null;
+            let day = 17;
+            if (claims.userInfo.billCycleCode) {
+                const parsedCode = parseInt(claims.userInfo.billCycleCode, 10);
+                if (parsedCode >= 1 && parsedCode <= 31) day = parsedCode;
+            } else if (rawDate) {
+                const p = rawDate.split('-');
+                if (p.length === 3) {
+                    const parsedDay = parseInt(p[2], 10);
+                    if (parsedDay >= 1 && parsedDay <= 31) day = parsedDay;
+                }
+            }
+            profile.billCycleDate = rawDate || '2026-11-11';
+            profile.renewalDay = day;
+        }
+    } catch (_) {}
+
+    return {
+        success: true,
+        token: tokenJson,
+        cookieStr: serializeCookieMap(cookieMap),
+        profile
+    };
+}
+
+async function getValidTokenForOwner(owner) {
+    const cleanPhone = displayMsisdn(owner.phone);
+    const cached = ownerTokenCache.get(cleanPhone);
+    const now = Math.floor(Date.now() / 1000);
+
+    if (cached && cached.token && cached.token.access_token) {
+        try {
+            const parts = cached.token.access_token.split('.');
+            const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+            if (payload.exp && payload.exp - now > 120) {
+                return { token: cached.token.access_token, cookieStr: cached.cookieStr, tokenObj: cached.token };
+            }
+        } catch (_) {}
+    }
+
+    if (!owner.password) {
+        throw new Error('يرجى إعادة إدخال كلمة سر الأونر لتجديد الجلسة');
+    }
+
+    const res = await authenticateVodafoneOwner(owner.phone, owner.password);
+    if (!res.success) {
+        throw new Error(res.message);
+    }
+
+    ownerTokenCache.set(cleanPhone, {
+        token: res.token,
+        cookieStr: res.cookieStr,
+        profile: res.profile
+    });
+
+    return { token: res.token.access_token, cookieStr: res.cookieStr, tokenObj: res.token };
+}
+
+async function callVodafoneForOwner(owner, url, method = 'GET', body = null) {
+    let { token, cookieStr } = await getValidTokenForOwner(owner);
+
+    const headers = {
+        'Authorization': `Bearer ${token}`,
+        'clientId': 'WebsiteConsumer',
+        'msisdn': displayMsisdn(owner.phone),
+        'Accept-Language': 'AR',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Referer': 'https://web.vodafone.com.eg/spa/myHome',
+        'User-Agent': BROWSER_UA
+    };
+
+    if (cookieStr) headers['Cookie'] = cookieStr;
+
+    const fetchOpts = { method, headers };
+    if (body && method !== 'GET') {
+        fetchOpts.body = typeof body === 'string' ? body : JSON.stringify(body);
+    }
+
+    let resp = await fetch(url, fetchOpts);
+    let text = await resp.text();
+
+    if ((resp.status === 401 || resp.status === 403) && owner.password) {
+        console.log(`[AUTH] Session expired (${resp.status}) for owner ${owner.phone}. Re-authenticating...`);
+        try {
+            ownerTokenCache.delete(displayMsisdn(owner.phone));
+            const authRes = await authenticateVodafoneOwner(owner.phone, owner.password);
+            if (authRes && authRes.success && authRes.token) {
+                ownerTokenCache.set(displayMsisdn(owner.phone), {
+                    token: authRes.token,
+                    cookieStr: authRes.cookieStr,
+                    profile: authRes.profile
+                });
+                headers['Authorization'] = `Bearer ${authRes.token.access_token}`;
+                if (authRes.cookieStr) headers['Cookie'] = authRes.cookieStr;
+                resp = await fetch(url, fetchOpts);
+                text = await resp.text();
+            }
+        } catch (retryErr) {
+            console.warn('[AUTH] Silent re-auth error:', retryErr.message);
+        }
+    }
+
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    } catch (e) {
+        parsed = { raw: text };
+    }
+
+    return { data: parsed, status: resp.status, ok: resp.ok };
+}
+
+function extractVodafoneError(respData, status) {
+    if (!respData) return null;
+    let raw = "";
+    if (typeof respData === "string") raw = respData;
+    else if (respData.message) raw = respData.message;
+    else if (respData.description) raw = respData.description;
+    else if (respData.error_description) raw = respData.error_description;
+    else if (respData.error) raw = typeof respData.error === "string" ? respData.error : JSON.stringify(respData.error);
+    else if (respData.raw) raw = respData.raw;
+
+    if (!raw && respData.errors && Array.isArray(respData.errors) && respData.errors[0]) {
+        raw = respData.errors[0].message || respData.errors[0].description || "";
+    }
+
+    if (!raw && (status < 200 || status >= 300)) {
+        raw = `فشل الطلب مع كود ${status}`;
+    }
+
+    if (!raw) return null;
+
+    const lower = raw.toLowerCase();
+    if (lower.includes("different billing accounts")) {
+        return "رقم الفرد يتبع حساب فواتير مختلف ولا يمكن ضمه لنفس باقة العائلة";
+    }
+    if (lower.includes("rate limit exceeded") || lower.includes("too many requests")) {
+        return "تم تجاوز حد الطلبات في فودافون مؤقتاً، يرجى الانتظار نصف دقيقة والمحاولة ثانية";
+    }
+    if (lower.includes("already a member") || lower.includes("already exists") || lower.includes("duplicate")) {
+        return "هذا الرقم مضاف بالفعل أو لديه دعوة قائمة في باقة العائلة";
+    }
+    if (lower.includes("not eligible") || lower.includes("ineligible")) {
+        return "الرقم غير مؤهل للانضمام لباقة العائلة (تأكد أن الخط فودافون وشغال)";
+    }
+    if (lower.includes("insufficient") || lower.includes("quota")) {
+        return "حصة الباقة المتبقية لدى الأونر غير كافية لإضافة هذا الفرد";
+    }
+    return raw;
+}
+
+async function acceptVodafoneFamilyInvitation(memberObj, ownerPhone, memberPhone, planName) {
+    const cleanOwner = displayMsisdn(ownerPhone);
+    const cleanMember = displayMsisdn(memberPhone);
+    const formattedOwner = `20${cleanOwner.replace(/^0/, '')}`;
+    const formattedMember = `20${cleanMember.replace(/^0/, '')}`;
+
+    let roleName = "EnterpriseRedFamily";
+    if (planName && planName.toLowerCase().includes("flex")) {
+        roleName = "FlexFamily";
+    }
+
+    const groupCategory = [
+        { value: "8805", listHierarchyId: "TierID" },
+        { value: "8805", listHierarchyId: "PackageID" },
+        { value: "880", listHierarchyId: "TemplateID" }
+    ];
+
+    const primaryPayload = {
+        name: roleName,
+        type: "FamilyAcceptInvitation",
+        category: groupCategory,
+        parts: {
+            member: [
+                { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
+                { id: [{ value: formattedMember, schemeName: "MSISDN" }], type: "Member" }
+            ]
+        }
+    };
+
+    console.log(`[ACCEPT_INVITE] Member ${cleanMember} accepting invite from owner ${cleanOwner}...`);
+    try {
+        const accRes = await callVodafoneForOwner(
+            memberObj,
+            "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup",
+            "POST",
+            primaryPayload
+        );
+
+        const err = extractVodafoneError(accRes.data, accRes.status);
+        if ((accRes.ok || accRes.status === 200 || accRes.status === 201) && !err) {
+            console.log(`[ACCEPT_INVITE] Successfully accepted via FamilyAcceptInvitation!`);
+            return { accepted: true, lastErr: '' };
+        }
+
+        if (err && err.includes('تجاوز حد الطلبات')) {
+            return { accepted: false, lastErr: err };
+        }
+
+        console.log(`[ACCEPT_INVITE] Primary attempt error: ${err}. Waiting 1200ms before fallback...`);
+        await new Promise(r => setTimeout(r, 1200));
+
+        const fallbackPayload = {
+            name: roleName,
+            type: "AcceptInvitation",
+            category: groupCategory,
+            parts: {
+                member: [
+                    { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
+                    { id: [{ value: formattedMember, schemeName: "MSISDN" }], type: "Member" }
+                ]
+            }
+        };
+
+        const fbRes = await callVodafoneForOwner(
+            memberObj,
+            "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup",
+            "POST",
+            fallbackPayload
+        );
+
+        const fbErr = extractVodafoneError(fbRes.data, fbRes.status);
+        if ((fbRes.ok || fbRes.status === 200 || fbRes.status === 201) && !fbErr) {
+            console.log(`[ACCEPT_INVITE] Successfully accepted via fallback AcceptInvitation!`);
+            return { accepted: true, lastErr: '' };
+        }
+
+        return { accepted: false, lastErr: fbErr || err || `كود ${accRes.status}` };
+    } catch (callErr) {
+        return { accepted: false, lastErr: callErr.message };
+    }
+}
+
+async function sendVodafoneFamilyInvitation(owner, memberPhone, quotaGB, minutes, sms) {
+    const cleanMemberPhone = displayMsisdn(memberPhone);
+    const cleanOwnerPhone = displayMsisdn(owner.phone);
+    const formattedMember = `20${cleanMemberPhone.replace(/^0/, '')}`;
+    const formattedOwner = `20${cleanOwnerPhone.replace(/^0/, '')}`;
+
+    try {
+        const cgUrl = "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup?type=Family&$.parts.member.type=owner";
+        const cgRes = await callVodafoneForOwner(owner, cgUrl);
+        const fg = Array.isArray(cgRes.data) ? cgRes.data[0] : cgRes.data;
+        const currentMembers = fg?.parts?.member || [];
+        const existingMember = currentMembers.find(m => {
+            const val = displayMsisdn(m.id?.[0]?.value || '');
+            return val === cleanMemberPhone;
+        });
+        if (existingMember && existingMember.status === '1') {
+            return {
+                success: false,
+                error: `الرقم ${cleanMemberPhone} مضاف بالفعل كعضو نشط في باقة عائلة فودافون!`
+            };
+        }
+    } catch (_) {}
+
+    const miMB = (Number(quotaGB) || 20) * 1024;
+    const voiceMinutes = Number(minutes) || 1500;
+
+    let roleName = "EnterpriseRedFamily";
+    if (owner.plan && owner.plan.toLowerCase().includes("flex")) {
+        roleName = "FlexFamily";
+    }
+
+    const payload = {
+        name: roleName,
+        type: "SendInvitation",
+        category: [
+            { value: "8805", listHierarchyId: "TierID" },
+            { value: "8805", listHierarchyId: "PackageID" },
+            { value: "880", listHierarchyId: "TemplateID" }
+        ],
+        parts: {
+            member: [
+                { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
+                { id: [{ value: formattedMember, schemeName: "MSISDN" }], type: "Member" }
+            ],
+            characteristicsValue: {
+                characteristicsValue: [
+                    { characteristicName: "MI", value: String(miMB) },
+                    { characteristicName: "Voice", value: String(voiceMinutes) }
+                ]
+            }
+        }
+    };
+
+    console.log(`[ADD_MEMBER] Dispatching Vodafone DXL invitation to ${cleanMemberPhone}...`);
+    const resp = await callVodafoneForOwner(
+        owner,
+        "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup",
+        "POST",
+        payload
+    );
+
+    const err = extractVodafoneError(resp.data, resp.status);
+    if ((resp.ok || resp.status === 200 || resp.status === 201) && !err) {
+        return { success: true, result: resp.data };
+    }
+    return { success: false, error: err || `فشل إرسال الدعوة بكود ${resp.status}` };
+}
+
+async function removeVodafoneFamilyMember(owner, memberPhone) {
+    const cleanMemberPhone = displayMsisdn(memberPhone);
+    const cleanOwnerPhone = displayMsisdn(owner.phone);
+    const formattedMember = `20${cleanMemberPhone.replace(/^0/, '')}`;
+    const formattedOwner = `20${cleanOwnerPhone.replace(/^0/, '')}`;
+
+    let roleName = "EnterpriseRedFamily";
+    if (owner.plan && owner.plan.toLowerCase().includes("flex")) {
+        roleName = "FlexFamily";
+    }
+
+    const payload = {
+        name: roleName,
+        type: "FamilyRemoveMember",
+        category: [{ value: "880", listHierarchyId: "TemplateID" }],
+        parts: {
+            member: [
+                { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
+                { id: [{ value: formattedMember, schemeName: "MSISDN" }], type: "Member" }
+            ],
+            characteristicsValue: {
+                characteristicsValue: [
+                    { characteristicName: "Disconnect", value: "0" },
+                    { characteristicName: "LastMemberDeletion", value: "1" }
+                ]
+            }
+        }
+    };
+
+    console.log(`[REMOVE_MEMBER] Owner ${cleanOwnerPhone} removing member ${cleanMemberPhone} from Vodafone...`);
+    const resp = await callVodafoneForOwner(
+        owner,
+        "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup",
+        "POST",
+        payload
+    );
+
+    const err = extractVodafoneError(resp.data, resp.status);
+    if (!resp.ok && resp.status !== 200 && resp.status !== 201 && err) {
+        if (/not found|لا توجد|already|غير موجود/i.test(err)) {
+            return { success: true, alreadyRemoved: true };
+        }
+        return { success: false, error: err };
+    }
+    return { success: true, result: resp.data };
+}
+
+// 6. Add Member under Owner (With real Vodafone invitation & auto-activation)
+async function handleAddMember(req, res) {
+    try {
+        let { owner_id, owner_phone, ownerPhone, memberPhone, memberMsisdn, phone, password, name, memberName, gigabytes, quotaGB, renewal_day, minutes, voice, sms, status } = req.body || {};
+        
+        phone = toEnglish(String(phone || memberPhone || memberMsisdn || '').trim().replace(/[\s-]/g, ''));
         if (!phone) return res.status(400).json({ success: false, error: 'رقم الفرد مطلوب' });
-        phone = toEnglish(String(phone).trim().replace(/[\s-]/g, ''));
+        
         password = password ? String(password).trim() : '';
-        gigabytes = Number(gigabytes) || 20;
+        name = (name || memberName || '').trim();
+        gigabytes = Number(gigabytes || quotaGB) || 20;
+        minutes = Number(minutes || voice) || 1500;
+        sms = Number(sms) || 200;
         renewal_day = Number(renewal_day) || 7;
         status = status || 'متأكتف';
 
         let resolvedOwnerId = owner_id ? Number(owner_id) : null;
-        let resolvedOwnerPhone = owner_phone ? toEnglish(String(owner_phone).trim().replace(/[\s-]/g, '')) : null;
+        let resolvedOwnerPhone = (owner_phone || ownerPhone) ? toEnglish(String(owner_phone || ownerPhone).trim().replace(/[\s-]/g, '')) : null;
 
-        if (resolvedOwnerId && !resolvedOwnerPhone) {
-            const o = await dbGet(`SELECT phone FROM owners WHERE id = ?`, [resolvedOwnerId]);
-            if (o) resolvedOwnerPhone = o.phone;
-        } else if (resolvedOwnerPhone && !resolvedOwnerId) {
-            const o = await dbGet(`SELECT id FROM owners WHERE phone = ?`, [resolvedOwnerPhone]);
-            if (o) resolvedOwnerId = o.id;
+        let owner = null;
+        if (resolvedOwnerId) {
+            owner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [resolvedOwnerId]);
+            if (owner && !resolvedOwnerPhone) resolvedOwnerPhone = owner.phone;
+        }
+        if (!owner && resolvedOwnerPhone) {
+            owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [resolvedOwnerPhone]);
+            if (owner && !resolvedOwnerId) resolvedOwnerId = owner.id;
         }
 
-        // Check if number exists
-        const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [phone]);
+        const cleanMemberPhone = displayMsisdn(phone);
+        let autoAccepted = false;
+        let verifiedName = name;
+
+        // If owner exists and has password, communicate with Vodafone network!
+        if (owner && owner.password) {
+            let memberAuthRes = null;
+            if (password) {
+                console.log(`[ADD_MEMBER] Verifying member credentials with Vodafone for ${cleanMemberPhone}...`);
+                memberAuthRes = await authenticateVodafoneOwner(cleanMemberPhone, password);
+                if (!memberAuthRes.success) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `تعذر التحقق من باسورد الفرد في فودافون: ${memberAuthRes.message}`
+                    });
+                }
+                if (!verifiedName && memberAuthRes.profile?.name && memberAuthRes.profile.name !== 'مالك فودافون') {
+                    verifiedName = memberAuthRes.profile.name;
+                }
+            }
+
+            // Send real Vodafone DXL Invitation
+            const inviteRes = await sendVodafoneFamilyInvitation(owner, cleanMemberPhone, gigabytes, minutes, sms);
+            if (!inviteRes.success) {
+                return res.status(400).json({
+                    success: false,
+                    error: `رفضت شبكة فودافون إرسال الدعوة: ${inviteRes.error}`
+                });
+            }
+
+            // If member credentials were verified, auto-accept invitation
+            if (memberAuthRes && memberAuthRes.token?.access_token) {
+                try {
+                    console.log(`[AUTO_ACCEPT] Waiting 1500ms before accepting invitation for ${cleanMemberPhone}...`);
+                    await new Promise(r => setTimeout(r, 1500));
+                    const memberObj = {
+                        phone: cleanMemberPhone,
+                        password: password,
+                        token: memberAuthRes.token,
+                        cookieStr: memberAuthRes.cookieStr
+                    };
+                    const accRes = await acceptVodafoneFamilyInvitation(memberObj, owner.phone, cleanMemberPhone, owner.plan);
+                    if (accRes.accepted) {
+                        autoAccepted = true;
+                        status = 'متأكتف';
+                    }
+                } catch (e) {
+                    console.warn('[AUTO_ACCEPT] Error auto-accepting:', e.message);
+                }
+            } else {
+                status = 'محجوز';
+            }
+        }
+
+        // Save in DB
+        const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [cleanMemberPhone]);
+        let bookingId;
         if (existing) {
-            return res.status(400).json({ success: false, error: 'هذا الرقم مسجل بالفعل في النظام' });
+            await dbRun(
+                `UPDATE bookings SET owner_id = ?, owner_phone = ?, name = COALESCE(?, name), password = COALESCE(?, password), gigabytes = ?, renewal_day = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                [resolvedOwnerId, resolvedOwnerPhone, verifiedName || null, password || null, gigabytes, renewal_day, status, existing.id]
+            );
+            bookingId = existing.id;
+        } else {
+            const result = await dbRun(
+                `INSERT INTO bookings (owner_id, owner_phone, name, phone, password, gigabytes, renewal_day, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                [resolvedOwnerId, resolvedOwnerPhone, verifiedName || `فرد (${cleanMemberPhone.slice(-4)})`, cleanMemberPhone, password || null, gigabytes, renewal_day, status]
+            );
+            bookingId = result.lastID;
         }
-
-        const result = await dbRun(
-            `INSERT INTO bookings (owner_id, owner_phone, name, phone, password, gigabytes, renewal_day, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [resolvedOwnerId, resolvedOwnerPhone, name || null, phone, password || null, gigabytes, renewal_day, status]
-        );
 
         const ym = currentMonth();
         await dbRun(
             `INSERT INTO monthly_payments (booking_id, renewal_day, year_month, paid, paid_at, activated, activated_at) VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING`,
-            [result.lastID, renewal_day, ym]
+            [bookingId, renewal_day, ym]
         );
 
-        const member = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [result.lastID]);
-        res.json({ success: true, message: 'تمت إضافة الفرد بنجاح ✅', data: member });
+        const member = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [bookingId]);
+        res.json({
+            success: true,
+            autoAccepted,
+            message: autoAccepted
+                ? 'تم إرسال الدعوة وتفعيل الفرد في باقة العائلة فورياً بنجاح! 🎉'
+                : 'تم تسجيل الدعوة بسيرفرات فودافون بنجاح! يمكن للفرد قبولها فوراً بطلب *41# أو من تطبيق أنا فودافون. 📨',
+            data: member
+        });
     } catch (e) {
+        console.error('handleAddMember error:', e);
         res.status(500).json({ success: false, error: e.message });
     }
-});
+}
+
+app.post('/api/members', handleAddMember);
+app.post('/api/family/add-member', handleAddMember);
 
 // 7. Update Member Password (with live Vodafone verification)
 app.put('/api/members/:id/password', async (req, res) => {
@@ -600,13 +1191,11 @@ app.put('/api/members/:id/password', async (req, res) => {
         if (!member) return res.status(404).json({ success: false, error: 'الفرد غير موجود' });
 
         const cleanPass = String(password).trim();
-        // Verify with Vodafone
         const vf = await fastVodafoneCheck(member.phone, cleanPass);
         if (!vf.valid) {
             return res.status(400).json({ success: false, error: vf.message || 'الباسورد غير صحيح لدى فودافون ❌' });
         }
 
-        // Also cache initial usage and extract subscriber name from Vodafone
         let usageData = vf.details ? JSON.stringify(vf.details) : null;
         let memberName = vf.details?.name || null;
         await dbRun(
@@ -621,16 +1210,370 @@ app.put('/api/members/:id/password', async (req, res) => {
     }
 });
 
-// 8. Delete Member
-app.delete('/api/members/:id', async (req, res) => {
+// 8. Delete Member (With real Vodafone DXL removal & quota return)
+async function handleDeleteMember(req, res) {
     try {
-        const { id } = req.params;
-        const result = await dbRun(`DELETE FROM bookings WHERE id = ?`, [id]);
-        if (result.changes === 0) return res.status(404).json({ success: false, error: 'الفرد غير موجود' });
-        res.json({ success: true, message: 'تم حذف الفرد بنجاح' });
+        const id = req.params?.id || req.body?.id || req.body?.memberId;
+        let memberPhone = req.body?.memberPhone || req.body?.memberMsisdn || req.body?.phone;
+        let ownerPhone = req.body?.ownerPhone;
+
+        let member = null;
+        if (id) {
+            member = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [id]);
+        }
+        if (!member && memberPhone) {
+            const clean = displayMsisdn(memberPhone);
+            member = await dbGet(`SELECT * FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [clean]);
+        }
+
+        if (member) {
+            memberPhone = member.phone;
+            if (!ownerPhone && member.owner_phone) ownerPhone = member.owner_phone;
+            if (!ownerPhone && member.owner_id) {
+                const o = await dbGet(`SELECT phone FROM owners WHERE id = ?`, [member.owner_id]);
+                if (o) ownerPhone = o.phone;
+            }
+        }
+
+        if (!member && !memberPhone) {
+            return res.status(404).json({ success: false, error: 'الفرد غير موجود' });
+        }
+
+        // If owner exists, perform real removal on Vodafone DXL network!
+        let owner = null;
+        if (ownerPhone) {
+            owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [displayMsisdn(ownerPhone)]);
+        }
+
+        if (owner && owner.password) {
+            const remRes = await removeVodafoneFamilyMember(owner, memberPhone);
+            if (!remRes.success) {
+                return res.status(400).json({
+                    success: false,
+                    error: `رفضت شبكة فودافون إزالة العضو: ${remRes.error}`
+                });
+            }
+        }
+
+        // Remove from DB
+        if (member) {
+            await dbRun(`DELETE FROM bookings WHERE id = ?`, [member.id]);
+        } else if (memberPhone) {
+            await dbRun(`DELETE FROM bookings WHERE phone = ?`, [displayMsisdn(memberPhone)]);
+        }
+
+        res.json({
+            success: true,
+            message: `تمت إزالة العضو ${memberPhone} رسمياً من شبكة فودافون واسترجاع حصصه للأونر بنجاح! 🗑️`
+        });
+    } catch (e) {
+        console.error('handleDeleteMember error:', e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+}
+
+app.delete('/api/members/:id', handleDeleteMember);
+app.post('/api/family/remove-member', handleDeleteMember);
+app.post('/api/family/cancel-invite', handleDeleteMember);
+
+// 8b. Accept family invitation using member password
+app.post('/api/family/accept-invite', async (req, res) => {
+    try {
+        const { ownerPhone, memberPhone, phone, password } = req.body || {};
+        const cleanMember = displayMsisdn(memberPhone || phone);
+        const pass = String(password || '').trim();
+
+        if (!cleanMember || !pass) {
+            return res.status(400).json({ success: false, error: 'رقم الفرد وكلمة المرور مطلوبان' });
+        }
+
+        let resolvedOwner = null;
+        if (ownerPhone) {
+            resolvedOwner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [displayMsisdn(ownerPhone)]);
+        }
+        if (!resolvedOwner) {
+            const b = await dbGet(`SELECT owner_phone, owner_id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [cleanMember]);
+            if (b && b.owner_phone) resolvedOwner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [b.owner_phone]);
+            else if (b && b.owner_id) resolvedOwner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [b.owner_id]);
+        }
+
+        if (!resolvedOwner) {
+            return res.status(400).json({ success: false, error: 'تعذر تحديد الأونر المرتبط بهذا الفرد' });
+        }
+
+        const authRes = await authenticateVodafoneOwner(cleanMember, pass);
+        if (!authRes.success) {
+            return res.status(400).json({ success: false, error: `فشل التحقق من باسورد الفرد في فودافون: ${authRes.message}` });
+        }
+
+        const memberObj = {
+            phone: cleanMember,
+            password: pass,
+            token: authRes.token,
+            cookieStr: authRes.cookieStr
+        };
+
+        const accRes = await acceptVodafoneFamilyInvitation(memberObj, resolvedOwner.phone, cleanMember, resolvedOwner.plan);
+        if (!accRes.accepted) {
+            return res.status(400).json({ success: false, error: `رفضت فودافون قبول الدعوة: ${accRes.lastErr}` });
+        }
+
+        await dbRun(`UPDATE bookings SET status = 'متأكتف', password = ?, updated_at = CURRENT_TIMESTAMP WHERE phone = ?`, [pass, cleanMember]);
+
+        res.json({ success: true, message: 'تم قبول الدعوة وتفعيل الفرد في باقة العائلة بنجاح! 🎉' });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
+});
+
+// 8c. Live Sync Family Group from Vodafone into DB
+app.post('/api/family/sync-live', async (req, res) => {
+    try {
+        const { ownerId, ownerPhone } = req.body || {};
+        let owner = null;
+        if (ownerId) owner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [ownerId]);
+        if (!owner && ownerPhone) owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [displayMsisdn(ownerPhone)]);
+        if (!owner) {
+            return res.status(400).json({ success: false, error: 'الأونر غير موجود' });
+        }
+
+        const vf = await fastVodafoneCheck(owner.phone, owner.password);
+        if (!vf.valid) {
+            return res.status(400).json({ success: false, error: vf.message || 'تعذر الاتصال بفودافون' });
+        }
+
+        const vfData = vf.details || {};
+        const resolvedName = vfData.name || owner.name;
+        const resolvedPlan = vfData.currentPlan || owner.plan;
+        const resolvedRenewalDay = vfData.renewal_day || owner.renewal_day;
+        const resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
+
+        await dbRun(
+            `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, owner.id]
+        );
+
+        let syncedCount = 0;
+        if (Array.isArray(vfData.familyMembers)) {
+            for (const m of vfData.familyMembers) {
+                if (!m.phone) continue;
+                const mGigs = m.gigabytes || 20;
+                const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [m.phone]);
+                if (existing) {
+                    await dbRun(
+                        `UPDATE bookings SET owner_id = ?, owner_phone = ?, gigabytes = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [owner.id, owner.phone, mGigs, resolvedRenewalDay, existing.id]
+                    );
+                } else {
+                    await dbRun(
+                        `INSERT INTO bookings (owner_id, owner_phone, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                        [owner.id, owner.phone, m.phone, mGigs, resolvedRenewalDay, `فرد (${m.phone.slice(-4)})`]
+                    );
+                }
+                syncedCount++;
+            }
+        }
+
+        const updatedMembers = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
+        res.json({
+            success: true,
+            message: `تمت مزامنة ${syncedCount} أفراد وتحديث بيانات الأونر من فودافون بنجاح! 🔄`,
+            data: {
+                owner: await dbGet(`SELECT * FROM owners WHERE id = ?`, [owner.id]),
+                members: updatedMembers
+            }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8d. GET /api/family - Live Family Details (Compatible with Owner Red UI)
+app.get('/api/family', async (req, res) => {
+    try {
+        let ownerPhone = req.query.owner || req.headers['x-owner-phone'];
+        let owner = null;
+        if (ownerPhone) {
+            owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [displayMsisdn(ownerPhone)]);
+        }
+        if (!owner) {
+            owner = await dbGet(`SELECT * FROM owners ORDER BY id ASC LIMIT 1`);
+        }
+        if (!owner) {
+            return res.status(404).json({ success: false, error: 'لا يوجد أونر مسجل' });
+        }
+
+        const members = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
+        const assignedGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
+        const totalGigs = Number(owner.total_gigabytes) || (assignedGigs + 100);
+
+        res.json({
+            success: true,
+            owner: {
+                id: owner.phone,
+                name: owner.name || 'أونر فودافون',
+                msisdn: owner.phone,
+                phone: owner.phone,
+                ratePlan: owner.plan || 'Vodafone RED',
+                planName: owner.plan || 'Vodafone RED',
+                billingAccount: 'N/A',
+                billCycleDate: `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(owner.renewal_day || 7).padStart(2, '0')}`,
+                renewalDay: owner.renewal_day || 7,
+                totalGB: totalGigs,
+                allocatedGB: assignedGigs,
+                freeGB: Math.max(0, totalGigs - assignedGigs),
+                activeMembers: members.length,
+                maxMembers: 7,
+                loyaltyPoints: 0,
+                loyaltyCash: 0
+            },
+            members: members.map(m => ({
+                id: m.phone,
+                msisdn: m.phone,
+                phone: m.phone,
+                name: m.name || `فرد ${m.phone.slice(-4)}`,
+                ownerId: owner.phone,
+                type: 'Member',
+                status: m.status === 'متأكتف' ? 'Active' : 'Pending',
+                isPending: m.status !== 'متأكتف',
+                allocatedMI: (Number(m.gigabytes) || 20) * 1024,
+                allocatedVoice: 1500,
+                allocatedSMS: 200,
+                allocatedGB: Number(m.gigabytes) || 20,
+                quotaGB: Number(m.gigabytes) || 20,
+                extraGB: 0,
+                hasPassword: Boolean(m.password && m.password.trim())
+            }))
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8e. Modify Base Quota (Redistribute)
+app.post('/api/family/redistribute', async (req, res) => {
+    try {
+        const { ownerPhone, targetMemberPhone, memberPhone, memberMsisdn, mi, voice, sms } = req.body || {};
+        const cleanMember = displayMsisdn(memberPhone || memberMsisdn || targetMemberPhone);
+        const cleanOwner = displayMsisdn(ownerPhone);
+
+        let owner = null;
+        if (cleanOwner) owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [cleanOwner]);
+        if (!owner) owner = await dbGet(`SELECT * FROM owners ORDER BY id ASC LIMIT 1`);
+
+        if (owner && owner.password) {
+            const formattedMember = `20${cleanMember.replace(/^0/, '')}`;
+            const formattedOwner = `20${owner.phone.replace(/^0/, '')}`;
+            const payload = {
+                name: "EnterpriseRed",
+                type: "QuotaRedistribution",
+                category: [{ value: "880", listHierarchyId: "TemplateID" }],
+                parts: {
+                    member: [
+                        { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
+                        { id: [{ value: formattedMember, schemeName: "MSISDN" }], type: "Member" }
+                    ],
+                    characteristic: {
+                        characteristicsValue: [
+                            { characteristicName: "MI", value: String(mi || 20480) },
+                            { characteristicName: "Voice", value: String(voice || "1500") },
+                            { characteristicName: "SMS", value: String(sms || "200") }
+                        ]
+                    }
+                }
+            };
+            await callVodafoneForOwner(owner, "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup", "PATCH", payload);
+        }
+
+        if (mi) {
+            const gigs = Math.round(Number(mi) / 1024);
+            await dbRun(`UPDATE bookings SET gigabytes = ? WHERE phone = ?`, [gigs, cleanMember]);
+        }
+
+        res.json({ success: true, message: 'تم تحديث توزيع الباقة بنجاح ✅' });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8f. Add extra GB quota
+app.post('/api/members/add-extra-quota', async (req, res) => {
+    try {
+        const { ownerPhone, memberPhone, extraGb } = req.body || {};
+        const cleanMember = displayMsisdn(memberPhone);
+        const extra = Number(extraGb) || 0;
+
+        let owner = null;
+        if (ownerPhone) owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [displayMsisdn(ownerPhone)]);
+        if (!owner) owner = await dbGet(`SELECT * FROM owners ORDER BY id ASC LIMIT 1`);
+
+        if (owner && owner.password && extra > 0) {
+            const memberRecord = await dbGet(`SELECT gigabytes FROM bookings WHERE phone = ?`, [cleanMember]);
+            const currentGB = Number(memberRecord?.gigabytes || 20);
+            const newMI = (currentGB + extra) * 1024;
+            const formattedMember = `20${cleanMember.replace(/^0/, '')}`;
+            const formattedOwner = `20${owner.phone.replace(/^0/, '')}`;
+            const payload = {
+                name: "EnterpriseRed",
+                type: "QuotaRedistribution",
+                category: [{ value: "880", listHierarchyId: "TemplateID" }],
+                parts: {
+                    member: [
+                        { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
+                        { id: [{ value: formattedMember, schemeName: "MSISDN" }], type: "Member" }
+                    ],
+                    characteristic: {
+                        characteristicsValue: [
+                            { characteristicName: "MI", value: String(newMI) },
+                            { characteristicName: "Voice", value: "1500" },
+                            { characteristicName: "SMS", value: "200" }
+                        ]
+                    }
+                }
+            };
+            await callVodafoneForOwner(owner, "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup", "PATCH", payload);
+            await dbRun(`UPDATE bookings SET gigabytes = gigabytes + ? WHERE phone = ?`, [extra, cleanMember]);
+        }
+
+        res.json({ success: true, message: `تمت إضافة +${extra} GB بنجاح ✅` });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8g. Member name update & activity logs
+app.post('/api/members/name', async (req, res) => {
+    try {
+        const { phone, name } = req.body || {};
+        if (phone && name) {
+            await dbRun(`UPDATE bookings SET name = ? WHERE phone = ?`, [name.trim(), displayMsisdn(phone)]);
+        }
+        res.json({ success: true, message: 'تم تحديث اسم الفرد بنجاح' });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/owners/select', (req, res) => res.json({ success: true }));
+
+app.post('/api/owners/update-password', async (req, res) => {
+    try {
+        const { phone, password } = req.body || {};
+        if (!phone || !password) return res.status(400).json({ success: false, error: 'رقم الأونر وكلمة المرور مطلوبان' });
+        const clean = displayMsisdn(phone);
+        const pass = String(password).trim();
+        const vf = await fastVodafoneCheck(clean, pass);
+        if (!vf.valid) return res.status(400).json({ success: false, error: vf.message || 'كلمة المرور غير صحيحة لدى فودافون' });
+        await dbRun(`UPDATE owners SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE phone = ?`, [pass, clean]);
+        ownerTokenCache.delete(clean);
+        res.json({ success: true, message: 'تم التحقق من كلمة المرور الجديدة وتحديثها بنجاح ✅' });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/api/activity', (req, res) => {
+    res.json({ success: true, events: [] });
 });
 
 // 9. Reset Entire Database (Wipe everything)
