@@ -176,13 +176,20 @@ async function initDB() {
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS notes TEXT;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'نشط';`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS password_valid BOOLEAN DEFAULT TRUE;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS password_error TEXT;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;`,
 
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_id INTEGER;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_phone TEXT;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS owner_name TEXT;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS name TEXT;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS password TEXT;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS password_valid BOOLEAN DEFAULT TRUE;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS password_error TEXT;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS gigabytes INTEGER DEFAULT 0;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'محجوز';`,
@@ -1339,7 +1346,12 @@ app.post('/api/family/sync-live', async (req, res) => {
 
         const vf = await fastVodafoneCheck(owner.phone, owner.password);
         if (!vf.valid) {
-            return res.status(400).json({ success: false, error: vf.message || 'تعذر الاتصال بفودافون' });
+            const errMsg = vf.message || 'الباسورد غير صحيح لدى فودافون ❌';
+            await dbRun(
+                `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                [errMsg, owner.id]
+            );
+            return res.status(400).json({ success: false, error: errMsg });
         }
 
         const vfData = vf.details || {};
@@ -1349,8 +1361,14 @@ app.post('/api/family/sync-live', async (req, res) => {
         const resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
 
         await dbRun(
-            `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
             [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, owner.id]
+        );
+
+        // Update owner_name on all bookings belonging to this owner
+        await dbRun(
+            `UPDATE bookings SET owner_name = ?, updated_at = CURRENT_TIMESTAMP WHERE (owner_id = ? OR owner_phone = ?)`,
+            [resolvedName, owner.id, owner.phone]
         );
 
         let syncedCount = 0;
@@ -1361,17 +1379,41 @@ app.post('/api/family/sync-live', async (req, res) => {
                 const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [m.phone]);
                 if (existing) {
                     await dbRun(
-                        `UPDATE bookings SET owner_id = ?, owner_phone = ?, gigabytes = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                        [owner.id, owner.phone, mGigs, resolvedRenewalDay, existing.id]
+                        `UPDATE bookings SET owner_id = ?, owner_phone = ?, owner_name = ?, gigabytes = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [owner.id, owner.phone, resolvedName, mGigs, resolvedRenewalDay, existing.id]
                     );
                 } else {
                     await dbRun(
-                        `INSERT INTO bookings (owner_id, owner_phone, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-                        [owner.id, owner.phone, m.phone, mGigs, resolvedRenewalDay, `فرد (${m.phone.slice(-4)})`]
+                        `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                        [owner.id, owner.phone, resolvedName, m.phone, mGigs, resolvedRenewalDay, `فرد (${m.phone.slice(-4)})`]
                     );
                 }
                 syncedCount++;
             }
+        }
+
+        // Also check passwords for this owner's members who have a password
+        const ownerMembers = await dbAll(
+            `SELECT id, phone, password FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND password IS NOT NULL AND TRIM(password) != '' AND deleted_at IS NULL`,
+            [owner.id, owner.phone]
+        );
+        for (const m of ownerMembers) {
+            try {
+                const mvf = await fastVodafoneCheck(m.phone, m.password.trim());
+                if (!mvf.valid) {
+                    await dbRun(
+                        `UPDATE bookings SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [mvf.message || 'الباسورد خطأ ❌', m.id]
+                    );
+                } else {
+                    let usageData = mvf.details ? JSON.stringify(mvf.details) : null;
+                    let memberName = mvf.details?.name || null;
+                    await dbRun(
+                        `UPDATE bookings SET password_valid = TRUE, password_error = NULL, name = COALESCE(?, name), last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [memberName, usageData, m.id]
+                    );
+                }
+            } catch (_) {}
         }
 
         const updatedMembers = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
@@ -1382,6 +1424,135 @@ app.post('/api/family/sync-live', async (req, res) => {
                 owner: await dbGet(`SELECT * FROM owners WHERE id = ?`, [owner.id]),
                 members: updatedMembers
             }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8c-2. BATCH SYNC ALL OWNERS & MEMBERS FROM VODAFONE
+app.post('/api/owners/sync-all', async (req, res) => {
+    try {
+        const owners = await dbAll(`SELECT * FROM owners ORDER BY id ASC`);
+        if (!owners || owners.length === 0) {
+            return res.json({ success: true, message: 'لا يوجد أونرز مسجلين للمزامنة', ownersCount: 0 });
+        }
+
+        let ownersSynced = 0;
+        let ownersFailed = 0;
+        let membersSynced = 0;
+        let membersFailed = 0;
+        const invalidNumbers = [];
+
+        for (const owner of owners) {
+            try {
+                const vf = await fastVodafoneCheck(owner.phone, owner.password);
+                if (!vf.valid) {
+                    ownersFailed++;
+                    const errMsg = vf.message || 'الباسورد خطأ ❌';
+                    await dbRun(
+                        `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [errMsg, owner.id]
+                    );
+                    invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: errMsg });
+                    continue;
+                }
+
+                ownersSynced++;
+                const vfData = vf.details || {};
+                const resolvedName = vfData.name || owner.name;
+                const resolvedPlan = vfData.currentPlan || owner.plan;
+                const resolvedRenewalDay = vfData.renewal_day || owner.renewal_day;
+                const resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
+
+                await dbRun(
+                    `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, owner.id]
+                );
+
+                // Update owner_name on all bookings linked to this owner
+                await dbRun(
+                    `UPDATE bookings SET owner_name = ?, updated_at = CURRENT_TIMESTAMP WHERE (owner_id = ? OR owner_phone = ?)`,
+                    [resolvedName, owner.id, owner.phone]
+                );
+
+                // Sync family members returned from Vodafone
+                if (Array.isArray(vfData.familyMembers)) {
+                    for (const m of vfData.familyMembers) {
+                        if (!m.phone) continue;
+                        const mGigs = m.gigabytes || 20;
+                        const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [m.phone]);
+                        if (existing) {
+                            await dbRun(
+                                `UPDATE bookings SET owner_id = ?, owner_phone = ?, owner_name = ?, gigabytes = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                                [owner.id, owner.phone, resolvedName, mGigs, resolvedRenewalDay, existing.id]
+                            );
+                        } else {
+                            await dbRun(
+                                `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                                [owner.id, owner.phone, resolvedName, m.phone, mGigs, resolvedRenewalDay, `فرد (${m.phone.slice(-4)})`]
+                            );
+                        }
+                    }
+                }
+
+                // Check passwords for members of this owner who have a password
+                const members = await dbAll(
+                    `SELECT id, phone, password FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND password IS NOT NULL AND TRIM(password) != '' AND deleted_at IS NULL`,
+                    [owner.id, owner.phone]
+                );
+
+                for (const member of members) {
+                    try {
+                        const mvf = await fastVodafoneCheck(member.phone, member.password.trim());
+                        if (!mvf.valid) {
+                            membersFailed++;
+                            const mErr = mvf.message || 'الباسورد خطأ ❌';
+                            await dbRun(
+                                `UPDATE bookings SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                                [mErr, member.id]
+                            );
+                            invalidNumbers.push({ phone: member.phone, role: 'فرد', error: mErr });
+                        } else {
+                            membersSynced++;
+                            let usageData = mvf.details ? JSON.stringify(mvf.details) : null;
+                            let memberName = mvf.details?.name || null;
+                            await dbRun(
+                                `UPDATE bookings SET password_valid = TRUE, password_error = NULL, name = COALESCE(?, name), last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                                [memberName, usageData, member.id]
+                            );
+                        }
+                    } catch (mErr) {
+                        membersFailed++;
+                        await dbRun(
+                            `UPDATE bookings SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                            [mErr.message, member.id]
+                        );
+                        invalidNumbers.push({ phone: member.phone, role: 'فرد', error: mErr.message });
+                    }
+                }
+            } catch (oErr) {
+                ownersFailed++;
+                await dbRun(
+                    `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [oErr.message, owner.id]
+                );
+                invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: oErr.message });
+            }
+        }
+
+        const msgParts = [];
+        if (ownersSynced > 0) msgParts.push(`تم تحديث ${ownersSynced} أونر بنجاح 👑`);
+        if (membersSynced > 0) msgParts.push(`وتحديث ${membersSynced} فرد 📱`);
+        if (ownersFailed > 0 || membersFailed > 0) {
+            msgParts.push(`⚠️ تنبيه: تم اكتشاف ${ownersFailed + membersFailed} أرقام بها الباسورد غلط ❌`);
+        }
+
+        res.json({
+            success: true,
+            message: msgParts.join(' | ') || 'تمت مزامنة الكل بنجاح 🔄',
+            summary: { ownersSynced, ownersFailed, membersSynced, membersFailed },
+            invalidNumbers: invalidNumbers.length > 0 ? invalidNumbers : undefined
         });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
@@ -1620,14 +1791,14 @@ app.get('/api/bookings', async (req, res) => {
     try {
         const { renewal_day, status, search, include_deleted } = req.query;
         let sql = `SELECT b.*, 
-            COALESCE(o.name, 'أونر فودافون') as owner_name,
+            COALESCE(o.name, b.owner_name, b.owner_phone, 'أونر فودافون') as owner_name,
             COALESCE(b.owner_phone, o.phone) as owner_phone,
             (SELECT COUNT(id)::int FROM booking_chats WHERE booking_id = b.id) as chats_count,
             GREATEST(1, COALESCE((SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) + 1, 1)) as renewal_count,
             (SELECT MIN(mp.year_month) FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as first_paid_month,
             (SELECT MAX(mp.year_month) FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as latest_paid_month
             FROM bookings b 
-            LEFT JOIN owners o ON b.owner_id = o.id
+            LEFT JOIN owners o ON (b.owner_id = o.id OR b.owner_phone = o.phone)
             WHERE 1=1`;
         const params = [];
 
