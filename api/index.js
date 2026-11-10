@@ -559,9 +559,17 @@ app.put('/api/owners/:id', async (req, res) => {
         notes = notes !== undefined ? notes : owner.notes;
 
         if (password && password !== owner.password) {
-            const vf = await fastVodafoneCheck(phone, password);
-            if (!vf.valid) {
-                return res.status(400).json({ success: false, error: vf.message || 'الباسورد الجديد غير صحيح لدى فودافون' });
+            const shouldChangeVodafone = req.body?.changeVodafone !== false;
+            if (shouldChangeVodafone) {
+                const vfChange = await changeVodafoneOwnerPassword(owner, owner.password, password);
+                if (!vfChange.success) {
+                    return res.status(400).json({ success: false, error: vfChange.error });
+                }
+            } else {
+                const vf = await fastVodafoneCheck(phone, password);
+                if (!vf.valid) {
+                    return res.status(400).json({ success: false, error: vf.message || 'الباسورد الجديد غير صحيح لدى فودافون' });
+                }
             }
         }
 
@@ -1162,6 +1170,114 @@ async function updateOwnerNameOnVodafone(owner, newName) {
     }
 
     return { success: true, vfUpdated };
+}
+
+async function changeVodafoneOwnerPassword(owner, oldPassword, newPassword) {
+    if (!owner || !owner.phone) {
+        return { success: false, error: 'بيانات الأونر غير موجودة' };
+    }
+    const cleanPhone = displayMsisdn(owner.phone);
+    const oldPass = String(oldPassword || owner.password || '').trim();
+    const newPass = String(newPassword || '').trim();
+
+    if (!newPass) {
+        return { success: false, error: 'كلمة المرور الجديدة مطلوبة' };
+    }
+
+    if (oldPass === newPass) {
+        return { success: false, error: 'كلمة المرور الجديدة مطابقة لكلمة المرور الحالية' };
+    }
+
+    // 1. Check if new password already works on Vodafone
+    try {
+        const checkNew = await fastVodafoneCheck(cleanPhone, newPass);
+        if (checkNew.valid) {
+            return { success: true, message: 'كلمة المرور تعمل بالفعل على فودافون', alreadyActive: true };
+        }
+    } catch (_) {}
+
+    // 2. Authenticate with current password to get fresh session & access token
+    let authRes = null;
+    try {
+        authRes = await authenticateVodafoneOwner(cleanPhone, oldPass);
+    } catch (e) {
+        return { success: false, error: `فشل تسجيل الدخول بالباسورد الحالي: ${e.message}` };
+    }
+
+    if (!authRes || !authRes.success || !authRes.token || !authRes.token.access_token) {
+        return { success: false, error: authRes?.message || 'فشل تسجيل الدخول بكلمة المرور الحالية لدى فودافون' };
+    }
+
+    const accessToken = authRes.token.access_token;
+    const cookieStr = authRes.cookieStr;
+
+    // 3. Dispatch PATCH to Vodafone DXL serviceAccountManagement endpoint
+    const dxlUrl = "https://web.vodafone.com.eg/services/dxl/sam/serviceAccountManagement/v1/serviceAccount";
+    const body = {
+        "@type": "userPrefsUpdate",
+        customerAccount: {
+            authentication: {
+                password: oldPass,
+                newPassword: newPass
+            }
+        },
+        resources: [
+            {
+                resourceType: "MSISDN",
+                IDs: [{ value: cleanPhone }]
+            }
+        ]
+    };
+
+    const headers = {
+        'Authorization': `Bearer ${accessToken}`,
+        'clientId': 'WebsiteConsumer',
+        'msisdn': cleanPhone,
+        'Accept-Language': 'AR',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Referer': 'https://web.vodafone.com.eg/spa/myHome',
+        'Origin': 'https://web.vodafone.com.eg',
+        'User-Agent': BROWSER_UA
+    };
+    if (cookieStr) headers['Cookie'] = cookieStr;
+
+    let patchRes;
+    try {
+        patchRes = await fetch(dxlUrl, {
+            method: 'PATCH',
+            headers,
+            body: JSON.stringify(body)
+        });
+    } catch (e) {
+        return { success: false, error: `فشل الاتصال بسيرفر فودافون: ${e.message}` };
+    }
+
+    let respText = '';
+    try { respText = await patchRes.text(); } catch (_) {}
+    let respJson = null;
+    try { respJson = JSON.parse(respText); } catch (_) {}
+
+    if (patchRes.status === 200 || patchRes.status === 204) {
+        ownerTokenCache.delete(cleanPhone);
+        return { success: true, message: 'تم تغيير كلمة المرور على فودافون بنجاح 100%' };
+    }
+
+    // Parse Vodafone error
+    let errorMsg = '';
+    if (respJson) {
+        if (respJson.code === "1042" || /repeated|used before/i.test(respJson.message || respJson.reason)) {
+            errorMsg = 'فودافون: كلمة المرور هذه تم استخدامها من قبل، يرجى اختيار كلمة سر جديدة تماماً';
+        } else if (/invalid.*password|authentication/i.test(respJson.message || respJson.reason)) {
+            errorMsg = 'فودافون: كلمة المرور الحالية غير مطابقة للسجلات';
+        } else {
+            errorMsg = respJson.message || respJson.reason || respJson.description || `خطأ من فودافون (${respJson.code || patchRes.status})`;
+        }
+    } else {
+        errorMsg = `فودافون رفضت التغيير (رمز الحالة ${patchRes.status})`;
+    }
+
+    return { success: false, error: errorMsg, raw: respText };
 }
 
 async function redistributeMemberQuotaOnVodafone(owner, memberPhone, newGB) {
@@ -2047,15 +2163,34 @@ app.post('/api/owners/select', (req, res) => res.json({ success: true }));
 
 app.post('/api/owners/update-password', async (req, res) => {
     try {
-        const { phone, password } = req.body || {};
+        const { phone, password, oldPassword, changeVodafone } = req.body || {};
         if (!phone || !password) return res.status(400).json({ success: false, error: 'رقم الأونر وكلمة المرور مطلوبان' });
         const clean = displayMsisdn(phone);
-        const pass = String(password).trim();
-        const vf = await fastVodafoneCheck(clean, pass);
-        if (!vf.valid) return res.status(400).json({ success: false, error: vf.message || 'كلمة المرور غير صحيحة لدى فودافون' });
-        await dbRun(`UPDATE owners SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE phone = ?`, [pass, clean]);
+        const newPass = String(password).trim();
+        const shouldChangeVodafone = changeVodafone !== false;
+
+        const owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [clean]);
+        if (!owner) return res.status(404).json({ success: false, error: 'الأونر غير موجود بالنظام' });
+
+        if (shouldChangeVodafone) {
+            const currentPass = oldPassword ? String(oldPassword).trim() : owner.password;
+            const vfChange = await changeVodafoneOwnerPassword(owner, currentPass, newPass);
+            if (!vfChange.success) {
+                return res.status(400).json({ success: false, error: vfChange.error });
+            }
+        } else {
+            const vf = await fastVodafoneCheck(clean, newPass);
+            if (!vf.valid) return res.status(400).json({ success: false, error: vf.message || 'كلمة المرور غير صحيحة لدى فودافون' });
+        }
+
+        await dbRun(`UPDATE owners SET password = ?, password_valid = TRUE, password_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE phone = ?`, [newPass, clean]);
         ownerTokenCache.delete(clean);
-        res.json({ success: true, message: 'تم التحقق من كلمة المرور الجديدة وتحديثها بنجاح ✅' });
+        res.json({
+            success: true,
+            message: shouldChangeVodafone
+                ? 'تم تغيير كلمة المرور فعلياً على فودافون 100% وتحديثها في النظام بنجاح ✅'
+                : 'تم التحقق من كلمة المرور الجديدة وتحديثها بنجاح ✅'
+        });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
