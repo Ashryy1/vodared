@@ -377,9 +377,11 @@ app.get('/api/owners', async (req, res) => {
                  ORDER BY b.id DESC`,
                 [o.id, o.phone]
             );
-            const assignedGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
-            const nextAssignedGigs = members.reduce((sum, m) => sum + (Number(m.next_gigabytes || m.gigabytes) || 0), 0);
-            const totalPkgGigs = o.total_gigabytes || assignedGigs;
+            const assignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
+            const nextAssignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.next_gigabytes || m.gigabytes) || 0), 0).toFixed(1));
+            const totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
+            const remainingGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+            const nextRemainingGigs = parseFloat(Math.max(0, totalPkgGigs - nextAssignedGigs).toFixed(1));
             return {
                 ...o,
                 members,
@@ -388,8 +390,8 @@ app.get('/api/owners', async (req, res) => {
                 next_assigned_gigabytes: nextAssignedGigs,
                 package_gigabytes: totalPkgGigs,
                 total_gigabytes: totalPkgGigs,
-                remaining_gigabytes: Math.max(0, totalPkgGigs - assignedGigs),
-                next_remaining_gigabytes: Math.max(0, totalPkgGigs - nextAssignedGigs)
+                remaining_gigabytes: remainingGigs,
+                next_remaining_gigabytes: nextRemainingGigs
             };
         }));
         res.json({ success: true, data: ownersWithMembers });
@@ -2833,7 +2835,17 @@ async function fastVodafoneCheck(msisdn, password) {
                 const smsChar = mChars.find((c) => c.characteristicName === "SMS");
 
                 const miMB = miChar ? Number(miChar.value) : 0;
-                const miGB = miMB > 0 ? Math.round(miMB / 1024) : 0;
+                let miGB = 0;
+                if (miMB > 0) {
+                    if (miMB % 1000 === 0) {
+                        miGB = Math.round(miMB / 1000);
+                    } else if (miMB > 500) {
+                        const d1000 = miMB / 1000;
+                        miGB = Math.abs(d1000 - Math.round(d1000)) < 0.15 ? Math.round(d1000) : Math.round(miMB / 1024);
+                    } else {
+                        miGB = Math.round(miMB / 1024);
+                    }
+                }
 
                 familyMembers.push({
                     phone: memberPhone,
@@ -2861,11 +2873,22 @@ async function fastVodafoneCheck(msisdn, password) {
 
     let totalGB = 0;
     if (familyTotalMI > 0) {
-        totalGB = Math.round(familyTotalMI / 1024);
+        const gb1000 = familyTotalMI / 1000;
+        const gb1024 = familyTotalMI / 1024;
+        if (familyTotalMI % 1000 === 0) {
+            totalGB = Math.round(gb1000);
+        } else if (Math.abs(gb1000 - Math.round(gb1000)) > 0.05) {
+            totalGB = parseFloat(gb1000.toFixed(1));
+        } else {
+            totalGB = Math.round(gb1024);
+        }
     } else {
         const dataItem = quotaSummary.find((q) => q.key === "data");
         if (dataItem && dataItem.total) {
-            totalGB = Math.round(dataItem.total / 1024);
+            const rawMb = Number(dataItem.total);
+            totalGB = rawMb > 5000 && (rawMb % 1000 === 0 || Math.abs(rawMb / 1000 - Math.round(rawMb / 1000)) > 0.05)
+                ? parseFloat((rawMb / 1000).toFixed(1))
+                : Math.round(rawMb / 1024);
         } else if (tariffItem && tariffItem.total) {
             totalGB = Math.round((tariffItem.total || 0) / 1024);
         }
