@@ -190,6 +190,8 @@ async function initDB() {
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS password_valid BOOLEAN DEFAULT TRUE;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS password_error TEXT;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS next_gigabytes INTEGER;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS next_quota_notes TEXT;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS gigabytes INTEGER DEFAULT 0;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'محجوز';`,
@@ -271,9 +273,44 @@ function isInPaymentWindow(renewalDay) {
     return true; // Payment always open
 }
 
-// Package prices
-const PACKAGE_PRICES = { 20: 250, 30: 350, 40: 450, 60: 600, 70: 700, 85: 800 };
-function getPackagePrice(gigs) { return PACKAGE_PRICES[parseInt(gigs)] || 0; }
+// Package prices (Configurable dynamically by Super Admin)
+const DEFAULT_PACKAGE_PRICES = { 20: 250, 30: 350, 40: 450, 60: 600, 70: 700, 85: 800 };
+let packagePricesCache = null;
+let packagePricesCacheTime = 0;
+
+async function getPackagePrices() {
+    const now = Date.now();
+    if (packagePricesCache && (now - packagePricesCacheTime < 30000)) {
+        return packagePricesCache;
+    }
+    try {
+        const row = await dbGet(`SELECT value FROM settings WHERE key = 'package_prices'`);
+        if (row && row.value) {
+            let parsed = row.value;
+            if (typeof parsed === 'string') {
+                try { parsed = JSON.parse(parsed); } catch (_) {}
+            }
+            if (typeof parsed === 'object' && parsed !== null && Object.keys(parsed).length > 0) {
+                packagePricesCache = parsed;
+                packagePricesCacheTime = now;
+                return parsed;
+            }
+        }
+    } catch (_) {}
+    packagePricesCache = { ...DEFAULT_PACKAGE_PRICES };
+    packagePricesCacheTime = now;
+    return packagePricesCache;
+}
+
+async function getPackagePrice(gigs) {
+    const prices = await getPackagePrices();
+    const g = parseInt(gigs, 10);
+    if (!isNaN(g)) {
+        if (prices[g] !== undefined) return Number(prices[g]);
+        if (prices[String(g)] !== undefined) return Number(prices[String(g)]);
+    }
+    return DEFAULT_PACKAGE_PRICES[g] || 0;
+}
 
 const STATUSES = ['محجوز', 'ضن', 'اتفعل', 'متأكتف', 'متكنسل'];
 const STATUS_ICONS = { 'محجوز': '🔴', 'ضن': '🟡', 'اتفعل': '🔵', 'متأكتف': '🟢', 'متكنسل': '⚫' };
@@ -341,13 +378,18 @@ app.get('/api/owners', async (req, res) => {
                 [o.id, o.phone]
             );
             const assignedGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
+            const nextAssignedGigs = members.reduce((sum, m) => sum + (Number(m.next_gigabytes || m.gigabytes) || 0), 0);
+            const totalPkgGigs = o.total_gigabytes || assignedGigs;
             return {
                 ...o,
                 members,
                 members_count: members.length,
                 assigned_gigabytes: assignedGigs,
-                package_gigabytes: o.total_gigabytes || assignedGigs,
-                total_gigabytes: o.total_gigabytes || assignedGigs
+                next_assigned_gigabytes: nextAssignedGigs,
+                package_gigabytes: totalPkgGigs,
+                total_gigabytes: totalPkgGigs,
+                remaining_gigabytes: Math.max(0, totalPkgGigs - assignedGigs),
+                next_remaining_gigabytes: Math.max(0, totalPkgGigs - nextAssignedGigs)
             };
         }));
         res.json({ success: true, data: ownersWithMembers });
@@ -1063,6 +1105,110 @@ async function removeVodafoneFamilyMember(owner, memberPhone) {
     return { success: true, result: resp.data };
 }
 
+async function updateOwnerNameOnVodafone(owner, newName) {
+    if (!owner || !owner.phone || !owner.password) return { success: false, error: 'بيانات الأونر غير مكتملة' };
+    const cleanName = String(newName || '').trim();
+    if (!cleanName) return { success: false, error: 'الاسم مطلوب' };
+
+    const nameParts = cleanName.split(/\s+/);
+    const firstName = nameParts[0] || cleanName;
+    const lastName = nameParts.slice(1).join(' ') || '.';
+
+    let vfUpdated = false;
+
+    // 1. Try Keycloak account update
+    try {
+        const keycloakUrl = "https://web.vodafone.com.eg/auth/realms/vf-realm/account";
+        const kcRes = await callVodafoneForOwner(owner, keycloakUrl, "POST", {
+            firstName: firstName,
+            lastName: lastName,
+            email: `${displayMsisdn(owner.phone)}@vodafone.com.eg`
+        });
+        if (kcRes.ok || kcRes.status === 200 || kcRes.status === 204) {
+            vfUpdated = true;
+        }
+    } catch (_) {}
+
+    // 2. Try DXL party individual update
+    if (!vfUpdated) {
+        try {
+            const dxlPartyUrl = "https://web.vodafone.com.eg/services/dxl/party/individual";
+            const partyRes = await callVodafoneForOwner(owner, dxlPartyUrl, "PATCH", {
+                givenName: firstName,
+                familyName: lastName,
+                formattedName: cleanName
+            });
+            if (partyRes.ok || partyRes.status === 200 || partyRes.status === 204) {
+                vfUpdated = true;
+            }
+        } catch (_) {}
+    }
+
+    // 3. Try DXL userProfile update
+    if (!vfUpdated) {
+        try {
+            const dxlProfileUrl = "https://web.vodafone.com.eg/services/dxl/profile/userProfile";
+            const profRes = await callVodafoneForOwner(owner, dxlProfileUrl, "PATCH", {
+                firstName: firstName,
+                lastName: lastName,
+                fullName: cleanName
+            });
+            if (profRes.ok || profRes.status === 200 || profRes.status === 204) {
+                vfUpdated = true;
+            }
+        } catch (_) {}
+    }
+
+    return { success: true, vfUpdated };
+}
+
+async function redistributeMemberQuotaOnVodafone(owner, memberPhone, newGB) {
+    if (!owner || !owner.phone || !owner.password) return { success: false, error: 'بيانات الأونر غير مكتملة' };
+    const cleanMember = displayMsisdn(memberPhone);
+    const cleanOwner = displayMsisdn(owner.phone);
+    const formattedMember = `20${cleanMember.replace(/^0/, '')}`;
+    const formattedOwner = `20${cleanOwner.replace(/^0/, '')}`;
+    const miMB = (Number(newGB) || 20) * 1024;
+
+    let roleName = "EnterpriseRedFamily";
+    if (owner.plan && owner.plan.toLowerCase().includes("flex")) {
+        roleName = "FlexFamily";
+    }
+
+    const payload = {
+        name: roleName,
+        type: "QuotaRedistribution",
+        category: [{ value: "880", listHierarchyId: "TemplateID" }],
+        parts: {
+            member: [
+                { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
+                { id: [{ value: formattedMember, schemeName: "MSISDN" }], type: "Member" }
+            ],
+            characteristic: {
+                characteristicsValue: [
+                    { characteristicName: "MI", value: String(miMB) },
+                    { characteristicName: "Voice", value: "1500" },
+                    { characteristicName: "SMS", value: "200" }
+                ]
+            }
+        }
+    };
+
+    console.log(`[REDISTRIBUTE] Owner ${cleanOwner} redistributing ${cleanMember} to ${newGB} GB (${miMB} MB)...`);
+    const resp = await callVodafoneForOwner(
+        owner,
+        "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup",
+        "PATCH",
+        payload
+    );
+
+    const err = extractVodafoneError(resp.data, resp.status);
+    if ((resp.ok || resp.status === 200 || resp.status === 204) && !err) {
+        return { success: true, result: resp.data };
+    }
+    return { success: false, error: err || `كود ${resp.status}` };
+}
+
 // 6. Add Member under Owner (With real Vodafone invitation & auto-activation)
 async function handleAddMember(req, res) {
     try {
@@ -1282,6 +1428,161 @@ async function handleDeleteMember(req, res) {
 app.delete('/api/members/:id', handleDeleteMember);
 app.post('/api/family/remove-member', handleDeleteMember);
 app.post('/api/family/cancel-invite', handleDeleteMember);
+
+// 8a-1. Modify Member Next-Month Quota (إعادة تقسيم الباقة للشهر القادم)
+app.post('/api/members/:id/next-quota', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { next_gigabytes, notes, applyNow } = req.body || {};
+        const member = await dbGet(`SELECT * FROM bookings WHERE id = ? AND deleted_at IS NULL`, [id]);
+        if (!member) return res.status(404).json({ success: false, error: 'الفرد غير موجود' });
+
+        const owner = await dbGet(`SELECT * FROM owners WHERE id = ? OR phone = ?`, [member.owner_id, member.owner_phone]);
+
+        if (next_gigabytes === null || next_gigabytes === undefined || next_gigabytes === '' || Number(next_gigabytes) <= 0) {
+            // Cancel upcoming quota change and stay with current quota
+            await dbRun(`UPDATE bookings SET next_gigabytes = NULL, next_quota_notes = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [id]);
+            return res.json({
+                success: true,
+                message: `تم إلغاء تغيير كوتة الشهر القادم للفرد ${member.phone} والعودة للكوتة الأصلية (${member.gigabytes} GB) بنجاح ✅`
+            });
+        }
+
+        const newGB = Number(next_gigabytes);
+        if (isNaN(newGB) || newGB <= 0) {
+            return res.status(400).json({ success: false, error: 'قيمة الجيجات للشهر القادم غير صحيحة' });
+        }
+
+        // Validate that owner's total package quota can accommodate this
+        if (owner) {
+            const otherMembers = await dbAll(
+                `SELECT id, gigabytes, next_gigabytes FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND id != ? AND deleted_at IS NULL`,
+                [owner.id, owner.phone, id]
+            );
+            const otherAssignedNext = otherMembers.reduce((sum, m) => sum + Number(m.next_gigabytes || m.gigabytes || 0), 0);
+            const maxOwnerGB = Number(owner.total_gigabytes) || (otherAssignedNext + Number(member.gigabytes));
+            if (otherAssignedNext + newGB > maxOwnerGB) {
+                const rem = Math.max(0, maxOwnerGB - otherAssignedNext);
+                return res.status(400).json({
+                    success: false,
+                    error: `باقة الأونر (${maxOwnerGB} GB) لا تكفي لتخصيص ${newGB} GB. الحد الأقصى المتاح لهذا الفرد للشهر القادم هو ${rem} GB.`
+                });
+            }
+        }
+
+        if (applyNow) {
+            // Immediately apply to active quota and push to Vodafone DXL
+            await dbRun(
+                `UPDATE bookings SET gigabytes = ?, next_gigabytes = NULL, next_quota_notes = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                [newGB, id]
+            );
+            let vfNote = '';
+            if (owner && owner.password) {
+                const vfRes = await redistributeMemberQuotaOnVodafone(owner, member.phone, newGB);
+                if (vfRes.success) vfNote = ' وتم تطبيق التقسيم الجديد على شبكة فودافون بنجاح';
+            }
+            return res.json({
+                success: true,
+                message: `تم تطبيق كوتة الباقة (${newGB} GB) فورياً${vfNote} ✅`,
+                data: { id, gigabytes: newGB, next_gigabytes: null }
+            });
+        }
+
+        // Schedule for next month
+        await dbRun(
+            `UPDATE bookings SET next_gigabytes = ?, next_quota_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [newGB, notes ? String(notes).trim() : null, id]
+        );
+
+        res.json({
+            success: true,
+            message: `تم تحديد كوتة الشهر القادم (${newGB} GB) بنجاح. ستُسحب من باقة الأونر وتنعكس في الفاتورة والتجديد القادم ✅`,
+            data: { id, phone: member.phone, gigabytes: member.gigabytes, next_gigabytes: newGB }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8a-2. Update Owner Name (with real Vodafone network update & DB sync)
+app.put('/api/owners/:id/name', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, updateVodafone = true } = req.body || {};
+        if (!name || !name.trim()) return res.status(400).json({ success: false, error: 'الاسم الجديد مطلوب' });
+        const owner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [id]);
+        if (!owner) return res.status(404).json({ success: false, error: 'الأونر غير موجود' });
+
+        const cleanName = name.trim();
+        let vfStatus = null;
+        if (updateVodafone !== false && owner.password) {
+            vfStatus = await updateOwnerNameOnVodafone(owner, cleanName);
+        }
+
+        await dbRun(`UPDATE owners SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [cleanName, id]);
+        await dbRun(`UPDATE bookings SET owner_name = ?, updated_at = CURRENT_TIMESTAMP WHERE (owner_id = ? OR owner_phone = ?)`, [cleanName, owner.id, owner.phone]);
+        ownerTokenCache.delete(displayMsisdn(owner.phone));
+
+        res.json({
+            success: true,
+            message: vfStatus?.vfUpdated 
+                ? 'تم تحديث اسم الأونر على فودافون وفي قاعدة البيانات بنجاح ✅' 
+                : 'تم حفظ وتحديث اسم الأونر في النظام وجميع الأرقام التابعة له بنجاح ✅',
+            data: { id: owner.id, name: cleanName, vfUpdated: Boolean(vfStatus?.vfUpdated) }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8a-3. Package Prices Management (Super Admin)
+app.get('/api/settings/package-prices', async (req, res) => {
+    try {
+        const prices = await getPackagePrices();
+        res.json({ success: true, data: prices });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/settings/package-prices', async (req, res) => {
+    try {
+        const { prices } = req.body || {};
+        if (!prices || typeof prices !== 'object') {
+            return res.status(400).json({ success: false, error: 'قائمة الأسعار غير صحيحة' });
+        }
+        const cleanPrices = {};
+        for (const [k, v] of Object.entries(prices)) {
+            const numKey = parseInt(k, 10);
+            const numVal = Number(v);
+            if (!isNaN(numKey) && numKey > 0 && !isNaN(numVal) && numVal >= 0) {
+                cleanPrices[numKey] = numVal;
+            }
+        }
+        await dbRun(`INSERT INTO settings (key, value) VALUES ('package_prices', ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify(cleanPrices)]);
+        packagePricesCache = cleanPrices;
+        packagePricesCacheTime = Date.now();
+        res.json({ success: true, message: 'تم حفظ وتحديث أسعار الباقات بنجاح ✅', data: cleanPrices });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 8a-4. Trigger Telegram Renewal Reminders (3 days before renewal + unpaid check)
+app.post('/api/admin/send-renewal-reminders', async (req, res) => {
+    try {
+        const result = await sendDailyRenewalReminders();
+        res.json({
+            success: true,
+            message: `تم إرسال ${result.sent} تذكيرات تجديد بنجاح عبر تليجرام 🔔 (تخطي ${result.skippedPaid} أرقام مسددة بالفعل)`,
+            sent: result.sent,
+            skippedPaid: result.skippedPaid,
+            sentList: result.sentList
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
 
 // 8b. Accept family invitation using member password
 app.post('/api/family/accept-invite', async (req, res) => {
@@ -2668,11 +2969,12 @@ app.post('/api/customer/register-verify', async (req, res) => {
         }
 
         // Return success with pricing
+        const currentPrices = await getPackagePrices();
         return res.json({
             success: true,
             verified: true,
             message: 'تم التحقق من الرقم بنجاح ✅',
-            packages: Object.entries(PACKAGE_PRICES).map(([gb, price]) => ({ gigabytes: parseInt(gb), price })),
+            packages: Object.entries(currentPrices).map(([gb, price]) => ({ gigabytes: parseInt(gb), price: Number(price) })),
             details: result.details || null
         });
     } catch (e) {
@@ -2716,6 +3018,107 @@ app.post('/api/bot/setup', async (req, res) => {
 
 
 // ============================================ //
+//          TELEGRAM RENEWAL REMINDERS          //
+// ============================================ //
+async function sendDailyRenewalReminders() {
+    const bot = await getBot();
+    if (!bot) return { sent: 0, skippedPaid: 0, error: 'البوت غير مفعل' };
+
+    const ym = currentMonth();
+    const today = new Date().getDate();
+    const prices = await getPackagePrices();
+
+    let paymentMethodsText = '';
+    try {
+        const row = await dbGet(`SELECT value FROM settings WHERE key = 'payment_methods'`);
+        if (row && row.value) {
+            let methods = typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
+            if (Array.isArray(methods) && methods.length > 0) {
+                paymentMethodsText = '\n💳 *طرق الدفع المعتمدة:*\n' + methods.map(m => `• ${m.name || 'طريقة دفع'}: \`${m.num || m.number}\``).join('\n');
+            }
+        }
+    } catch (_) {}
+
+    const bookings = await dbAll(
+        `SELECT b.*, 
+         COALESCE(o.name, b.owner_name, 'أونر فودافون') as owner_name
+         FROM bookings b 
+         LEFT JOIN owners o ON (b.owner_id = o.id OR b.owner_phone = o.phone)
+         WHERE b.status = 'متأكتف' 
+           AND b.deleted_at IS NULL 
+           AND b.owner_tg IS NOT NULL 
+           AND TRIM(b.owner_tg) != ''`
+    );
+
+    let sent = 0;
+    let skippedPaid = 0;
+    const sentList = [];
+
+    for (const b of bookings) {
+        // Skip if already paid this month
+        const payRow = await dbGet(`SELECT paid FROM monthly_payments WHERE booking_id = ? AND year_month = ?`, [b.id, ym]);
+        if (payRow && payRow.paid === 1) {
+            skippedPaid++;
+            continue;
+        }
+
+        // Skip if there's already a pending payment awaiting review
+        const pendingPay = await dbGet(`SELECT id FROM customer_payments WHERE booking_id = ? AND year_month = ? AND status = 'pending'`, [b.id, ym]);
+        if (pendingPay) {
+            continue;
+        }
+
+        const daysToRenewal = b.renewal_day - today;
+
+        // Reminder sent within 3 days before renewal (3, 2, 1), on renewal day (0), or up to 3 days late
+        if (daysToRenewal >= -3 && daysToRenewal <= 3) {
+            const effectiveGigs = b.next_gigabytes || b.gigabytes;
+            const price = prices[effectiveGigs] || prices[String(effectiveGigs)] || (await getPackagePrice(effectiveGigs));
+
+            let timeBadge = '';
+            if (daysToRenewal === 3) timeBadge = 'متبقي 3 أيام على التجديد ⏳';
+            else if (daysToRenewal === 2) timeBadge = 'متبقي يومان على موعد التجديد ⏳';
+            else if (daysToRenewal === 1) timeBadge = '⚠️ التجديد غداً!';
+            else if (daysToRenewal === 0) timeBadge = '🚨 اليوم موعد التجديد!';
+            else timeBadge = `⚠️ متأخر عن التجديد بـ ${Math.abs(daysToRenewal)} أيام!`;
+
+            let msg = `⚠️ *تنبيه اقتراب موعد التجديد - فودافون ريد*\n\n`;
+            msg += `عزيزي العميل، نود تذكيرك بميعاد تجديد باقة خطك:\n`;
+            msg += `📱 *رقم الخط:* \`${b.phone}\`\n`;
+            msg += `📦 *حجم الباقة:* *${effectiveGigs} GB*${b.next_gigabytes ? ' (كوتة الشهر القادم 🔄)' : ''}\n`;
+            msg += `💰 *المبلغ المطلوب:* *${price} جنيه مصري*\n`;
+            msg += `🗓️ *الموعد:* *${timeBadge}* (يوم ${b.renewal_day} في الشهر)\n`;
+
+            if (paymentMethodsText) {
+                msg += paymentMethodsText + '\n';
+            }
+
+            msg += `\n📌 *يرجى سداد المبلغ ورفع إيصال التحويل عبر التطبيق لتجنب إيقاف الخدمة تلقائياً.*`;
+
+            const webAppUrl = process.env.WEBAPP_URL || 'https://vodared.vercel.app';
+
+            try {
+                await bot.sendMessage(b.owner_tg, msg, {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '💳 فتح التطبيق وسداد الفاتورة', web_app: { url: webAppUrl } }],
+                            [{ text: '💬 الدعم الفني', url: 'https://t.me/hak_alqulub' }]
+                        ]
+                    }
+                });
+                sent++;
+                sentList.push({ phone: b.phone, daysLeft: daysToRenewal, tg_id: b.owner_tg });
+            } catch (sendErr) {
+                console.error(`[REMINDER] Error sending to ${b.owner_tg} (${b.phone}):`, sendErr.message);
+            }
+        }
+    }
+
+    return { sent, skippedPaid, sentList };
+}
+
+// ============================================ //
 //                  DAILY CRON                  //
 // ============================================ //
 async function runDailyTasks() {
@@ -2728,30 +3131,8 @@ async function runDailyTasks() {
         const lastNotif = await dbGet(`SELECT value FROM settings WHERE key = 'last_notif_date'`);
         if (lastNotif && lastNotif.value === dateStr) return; // Already did daily tasks
 
-        // warnings deleted here
-
-        // Send reminders
-        const curM = currentMonth();
-        const bookingsList = await dbAll(`SELECT * FROM bookings WHERE status = 'متأكتف' AND deleted_at IS NULL AND owner_tg IS NOT NULL`);
-        for (const b of bookingsList) {
-            const day = b.renewal_day;
-            const w = getPaymentWindow(day);
-            const today = new Date().getDate();
-            if (today >= w.start && today <= w.end) {
-                const payRow = await dbGet(`SELECT paid FROM monthly_payments WHERE booking_id = ? AND year_month = ?`, [b.id, curM]);
-                if (!payRow || payRow.paid !== 1) {
-                    const daysLeft = day - today;
-                    if (daysLeft >= 0) {
-                        const msg = `⚠️ نرجو دفع باقتك لرقم ${b.phone} لعدم ايقاف خطك ومتبقي مهله ${daysLeft} أيام.`;
-                        try {
-                            await bot.sendMessage(b.owner_tg, msg);
-                        } catch (e) {
-                            console.error(`[CRON] failed to send reminder to ${b.owner_tg} (${b.phone}):`, e.message || e);
-                        }
-                    }
-                }
-            }
-        }
+        // Send reminders to all unpaid lines due in 3 days
+        await sendDailyRenewalReminders();
 
         // Clean up deleted items older than 10 days
         await dbRun(`DELETE FROM bookings WHERE deleted_at < NOW() - INTERVAL '10 days'`);
@@ -4149,7 +4530,18 @@ app.post('/api/payments/:id/approve', async (req, res) => {
             // RENEWAL: Mark monthly payment as paid
             booking = targetBookingId ? await dbGet(`SELECT * FROM bookings WHERE id = ?`, [targetBookingId]) : null;
             if (booking) {
-                await dbRun(`UPDATE bookings SET status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [targetBookingId]);
+                if (booking.next_gigabytes && Number(booking.next_gigabytes) > 0) {
+                    const newGB = Number(booking.next_gigabytes);
+                    await dbRun(`UPDATE bookings SET gigabytes = ?, next_gigabytes = NULL, next_quota_notes = NULL, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [newGB, targetBookingId]);
+                    try {
+                        const owner = await dbGet(`SELECT * FROM owners WHERE id = ? OR phone = ?`, [booking.owner_id, booking.owner_phone]);
+                        if (owner && owner.password) {
+                            await redistributeMemberQuotaOnVodafone(owner, booking.phone, newGB);
+                        }
+                    } catch (_) {}
+                } else {
+                    await dbRun(`UPDATE bookings SET status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [targetBookingId]);
+                }
             }
             if (targetBookingId) {
                 const existing = await dbGet(`SELECT * FROM monthly_payments WHERE booking_id = ? AND year_month = ?`, [targetBookingId, payYm]);
@@ -4370,56 +4762,27 @@ app.post('/api/admin/closed-days', async (req, res) => {
 app.get('/api/cron', async (req, res) => {
     // Vercel cron calls this route automatically
     try {
+        const reminderResult = await sendDailyRenewalReminders();
         const botInstance = await getBot();
-        if (!botInstance) return res.status(500).json({ error: 'البوت غير متصل' });
 
         const superAdminId = '1255885099';
-        const ym = currentMonth();
-        const todayDate = new Date();
-        const today = todayDate.getDate();
+        const today = new Date().getDate();
 
-        // We only care about active bookings (متأكتف)
+        // 1 day before warnings for Super Admin
+        const day1Warnings = [];
         const bookingsList = await dbAll(`SELECT * FROM bookings WHERE status = 'متأكتف' AND deleted_at IS NULL`);
-
-        let notPaidTotal = 0;
-        let day1Warnings = []; // 1 day left
-        let sentRemindersCount = 0;
+        const ym = currentMonth();
 
         for (const b of bookingsList) {
-            // Check if paid this month
             const payRow = await dbGet(`SELECT paid FROM monthly_payments WHERE booking_id = ? AND year_month = ?`, [b.id, ym]);
-            const isPaid = (payRow && payRow.paid === 1);
-
-            if (isPaid) continue; // Skip paid lines
-
-            const daysToRenewal = b.renewal_day - today;
-
-            // Is it within the 6-day grace period BEFORE renewal?
-            if (daysToRenewal <= 6 && daysToRenewal >= 0) {
-                notPaidTotal++;
-
-                // If exactly 1 day before, add to Admin summary list
-                if (daysToRenewal === 1) {
-                    day1Warnings.push(`📱 \`${b.phone}\` | ${b.gigabytes}G | التجديد غداً`);
-                }
-
-                // Send reminder to user if linked to Telegram
-                if (b.owner_tg) {
-                    const daysWord = daysToRenewal === 0 ? 'اليوم!' : (daysToRenewal === 1 ? 'غداً!' : `خلال ${daysToRenewal} أيام`);
-                    const msg = `⚠️ *تذكير آلي من فودافون ريد*\n\nالعميل العزيز،\nنرجو سداد قيمة باقة الخط: ${b.phone}\nمتبقى على موعد التجديد: *${daysWord}*\n\nيرجى الدفع لتجنب إيقاف الخدمة تلقائياً.`;
-
-                    try {
-                        await botInstance.sendMessage(b.owner_tg, msg, { parse_mode: 'Markdown' });
-                        sentRemindersCount++;
-                    } catch (e) {
-                        console.error('Failed to send cron reminder to', b.owner_tg);
-                    }
-                }
+            if (payRow && payRow.paid === 1) continue;
+            if (b.renewal_day - today === 1) {
+                day1Warnings.push(`📱 \`${b.phone}\` | ${b.next_gigabytes || b.gigabytes}G | التجديد غداً`);
             }
         }
 
         // Send summary to Super Admin
-        if (day1Warnings.length > 0) {
+        if (botInstance && day1Warnings.length > 0) {
             let adminMsg = `🚨 *تقرير تلقائي: خطوط تتجدد غداً ولم يتم الدفع لها!*\n\n`;
             adminMsg += day1Warnings.join('\n');
             adminMsg += `\n\nيُرجى اتخاذ اللازم.`;
@@ -4431,7 +4794,8 @@ app.get('/api/cron', async (req, res) => {
         res.json({
             success: true,
             message: 'تم تنفيذ المهام المجدولة اليومية',
-            sentReminders: sentRemindersCount,
+            sentReminders: reminderResult.sent || 0,
+            skippedPaid: reminderResult.skippedPaid || 0,
             adminAlertLists: day1Warnings.length
         });
 
