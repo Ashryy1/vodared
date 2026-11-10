@@ -389,7 +389,10 @@ app.get('/api/owners', async (req, res) => {
             );
             const assignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
             const nextAssignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.next_gigabytes || m.gigabytes) || 0), 0).toFixed(1));
-            const totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
+            let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
+            if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205) || (!totalPkgGigs && o.plan?.includes('3000'))) {
+                totalPkgGigs = 204.8;
+            }
             const remainingGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
             const nextRemainingGigs = parseFloat(Math.max(0, totalPkgGigs - nextAssignedGigs).toFixed(1));
             return {
@@ -423,13 +426,21 @@ app.get('/api/owners/:id', async (req, res) => {
              ORDER BY b.id DESC`,
             [o.id, o.phone]
         );
+        const assignedGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
+        let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
+        if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205) || (!totalPkgGigs && o.plan?.includes('3000'))) {
+            totalPkgGigs = 204.8;
+        }
         res.json({
             success: true,
             data: {
                 ...o,
                 members,
                 members_count: members.length,
-                total_gigabytes: members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0)
+                assigned_gigabytes: assignedGigs,
+                package_gigabytes: totalPkgGigs,
+                total_gigabytes: totalPkgGigs,
+                remaining_gigabytes: parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1))
             }
         });
     } catch (e) {
@@ -461,7 +472,11 @@ app.post('/api/owners', async (req, res) => {
         const resolvedName = name || vfData.name || 'أونر فودافون';
         const resolvedPlan = vfData.currentPlan || null;
         const resolvedRenewalDay = vfData.renewal_day || (renewal_day && Number(renewal_day) !== 7 ? Number(renewal_day) : 11);
-        const resolvedTotalGB = vfData.total_gigabytes || 0;
+        let resolvedTotalGB = vfData.total_gigabytes || 0;
+        resolvedTotalGB = Number(resolvedTotalGB) || 0;
+        if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205) || (!resolvedTotalGB && String(resolvedPlan || '').includes('3000'))) {
+            resolvedTotalGB = 204.8;
+        }
 
         // 2. Save or update Owner
         try {
@@ -1767,7 +1782,11 @@ app.post('/api/members/:id/next-quota', async (req, res) => {
                 [owner.id, owner.phone, id]
             );
             const otherAssignedNext = otherMembers.reduce((sum, m) => sum + Number(m.next_gigabytes || m.gigabytes || 0), 0);
-            const maxOwnerGB = Number(owner.total_gigabytes) || (otherAssignedNext + Number(member.gigabytes));
+            let maxOwnerGB = Number(owner.total_gigabytes) || 0;
+            if (maxOwnerGB === 200 || (maxOwnerGB >= 195 && maxOwnerGB <= 205) || (!maxOwnerGB && String(owner.plan || '').includes('3000'))) {
+                maxOwnerGB = 204.8;
+            }
+            if (!maxOwnerGB) maxOwnerGB = (otherAssignedNext + Number(member.gigabytes));
             if (otherAssignedNext + newGB > maxOwnerGB) {
                 const rem = Math.max(0, maxOwnerGB - otherAssignedNext);
                 return res.status(400).json({
@@ -1822,13 +1841,12 @@ app.put('/api/owners/:id/name', async (req, res) => {
             name = name.name;
         }
         if (syncVodafone !== undefined) updateVodafone = syncVodafone;
-        name = typeof name === 'string' ? name.trim() : '';
-        if (!name) return res.status(400).json({ success: false, error: 'الاسم الجديد مطلوب' });
+        const cleanName = String(name || '').trim();
+        if (!cleanName) return res.status(400).json({ success: false, error: 'الاسم الجديد مطلوب' });
 
         const owner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [id]);
         if (!owner) return res.status(404).json({ success: false, error: 'الأونر غير موجود' });
 
-        const cleanName = name;
         let vfStatus = null;
         if (updateVodafone !== false && owner.password) {
             vfStatus = await updateOwnerNameOnVodafone(owner, cleanName);
@@ -1886,21 +1904,24 @@ app.post('/api/settings/package-prices', async (req, res) => {
 // 8a-4. Trigger Telegram Renewal Reminders (3 days before renewal + unpaid check)
 app.post('/api/admin/send-renewal-reminders', async (req, res) => {
     try {
-        const result = await sendDailyRenewalReminders();
+        const result = (await sendDailyRenewalReminders()) || { sent: 0, skippedPaid: 0, sentList: [] };
+        const sent = Number(result?.sent) || 0;
+        const skippedPaid = Number(result?.skippedPaid) || 0;
+        const sentList = Array.isArray(result?.sentList) ? result.sentList : [];
         res.json({
             success: true,
-            message: `تم إرسال ${result.sent} تذكيرات تجديد بنجاح عبر تليجرام 🔔 (تخطي ${result.skippedPaid} أرقام مسددة بالفعل)`,
-            sent: result.sent,
-            skippedPaid: result.skippedPaid,
-            sentList: result.sentList,
+            message: `تم إرسال ${sent} تذكيرات تجديد بنجاح عبر تليجرام 🔔 (تخطي ${skippedPaid} أرقام مسددة بالفعل)`,
+            sent,
+            skippedPaid,
+            sentList,
             data: {
-                sent: result.sent,
-                skippedPaid: result.skippedPaid,
-                sentList: result.sentList
+                sent,
+                skippedPaid,
+                sentList
             }
         });
     } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
+        res.status(500).json({ success: false, error: e.message || 'فشل إرسال التذكيرات' });
     }
 });
 
@@ -1979,7 +2000,11 @@ app.post('/api/family/sync-live', async (req, res) => {
         const resolvedName = vfData.name || owner.name;
         const resolvedPlan = vfData.currentPlan || owner.plan;
         const resolvedRenewalDay = vfData.renewal_day || owner.renewal_day;
-        const resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
+        let resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
+        resolvedTotalGB = Number(resolvedTotalGB) || 0;
+        if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205) || (!resolvedTotalGB && String(resolvedPlan || owner.plan || '').includes('3000'))) {
+            resolvedTotalGB = 204.8;
+        }
 
         await dbRun(
             `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -2088,7 +2113,11 @@ app.post('/api/owners/sync-all', async (req, res) => {
                 const resolvedName = vfData.name || owner.name;
                 const resolvedPlan = vfData.currentPlan || owner.plan;
                 const resolvedRenewalDay = vfData.renewal_day || owner.renewal_day;
-                const resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
+                let resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
+                resolvedTotalGB = Number(resolvedTotalGB) || 0;
+                if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205) || (!resolvedTotalGB && String(resolvedPlan || owner.plan || '').includes('3000'))) {
+                    resolvedTotalGB = 204.8;
+                }
 
                 await dbRun(
                     `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -2205,7 +2234,11 @@ app.get('/api/family', async (req, res) => {
 
         const members = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
         const assignedGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
-        const totalGigs = Number(owner.total_gigabytes) || (assignedGigs + 100);
+        let totalGigs = Number(owner.total_gigabytes) || 0;
+        if (totalGigs === 200 || (totalGigs >= 195 && totalGigs <= 205) || (!totalGigs && String(owner.plan || '').includes('3000'))) {
+            totalGigs = 204.8;
+        }
+        if (!totalGigs) totalGigs = (assignedGigs + 100);
 
         res.json({
             success: true,
@@ -3265,7 +3298,9 @@ async function fastVodafoneCheck(msisdn, password) {
     if (familyTotalMI > 0) {
         const gb1000 = familyTotalMI / 1000;
         const gb1024 = familyTotalMI / 1024;
-        if (familyTotalMI % 1000 === 0) {
+        if (familyTotalMI === 204800 || familyTotalMI === 200000 || (gb1024 >= 195 && gb1024 <= 205) || (gb1000 >= 195 && gb1000 <= 205)) {
+            totalGB = 204.8;
+        } else if (familyTotalMI % 1000 === 0) {
             totalGB = Math.round(gb1000);
         } else if (Math.abs(gb1000 - Math.round(gb1000)) > 0.05) {
             totalGB = parseFloat(gb1000.toFixed(1));
@@ -3276,11 +3311,20 @@ async function fastVodafoneCheck(msisdn, password) {
         const dataItem = quotaSummary.find((q) => q.key === "data");
         if (dataItem && dataItem.total) {
             const rawMb = Number(dataItem.total);
-            totalGB = rawMb > 5000 && (rawMb % 1000 === 0 || Math.abs(rawMb / 1000 - Math.round(rawMb / 1000)) > 0.05)
-                ? parseFloat((rawMb / 1000).toFixed(1))
-                : Math.round(rawMb / 1024);
+            if (rawMb === 204800 || rawMb === 200000 || (rawMb >= 195000 && rawMb <= 205000)) {
+                totalGB = 204.8;
+            } else {
+                totalGB = rawMb > 5000 && (rawMb % 1000 === 0 || Math.abs(rawMb / 1000 - Math.round(rawMb / 1000)) > 0.05)
+                    ? parseFloat((rawMb / 1000).toFixed(1))
+                    : Math.round(rawMb / 1024);
+            }
         } else if (tariffItem && tariffItem.total) {
-            totalGB = Math.round((tariffItem.total || 0) / 1024);
+            const raw = Number(tariffItem.total) || 0;
+            if (raw === 204800 || raw === 200000 || (raw >= 195000 && raw <= 205000)) {
+                totalGB = 204.8;
+            } else {
+                totalGB = Math.round(raw / 1024);
+            }
         }
     }
 
