@@ -1433,7 +1433,8 @@ app.post('/api/family/cancel-invite', handleDeleteMember);
 app.post('/api/members/:id/next-quota', async (req, res) => {
     try {
         const { id } = req.params;
-        const { next_gigabytes, notes, applyNow } = req.body || {};
+        const { next_gigabytes, notes, applyNow, apply_now } = req.body || {};
+        const isApplyNow = Boolean(applyNow || apply_now);
         const member = await dbGet(`SELECT * FROM bookings WHERE id = ? AND deleted_at IS NULL`, [id]);
         if (!member) return res.status(404).json({ success: false, error: 'الفرد غير موجود' });
 
@@ -1444,7 +1445,8 @@ app.post('/api/members/:id/next-quota', async (req, res) => {
             await dbRun(`UPDATE bookings SET next_gigabytes = NULL, next_quota_notes = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [id]);
             return res.json({
                 success: true,
-                message: `تم إلغاء تغيير كوتة الشهر القادم للفرد ${member.phone} والعودة للكوتة الأصلية (${member.gigabytes} GB) بنجاح ✅`
+                message: `تم إلغاء تغيير كوتة الشهر القادم للفرد ${member.phone} والعودة للكوتة الأصلية (${member.gigabytes} GB) بنجاح ✅`,
+                data: { id, gigabytes: member.gigabytes, next_gigabytes: null }
             });
         }
 
@@ -1470,7 +1472,7 @@ app.post('/api/members/:id/next-quota', async (req, res) => {
             }
         }
 
-        if (applyNow) {
+        if (isApplyNow) {
             // Immediately apply to active quota and push to Vodafone DXL
             await dbRun(
                 `UPDATE bookings SET gigabytes = ?, next_gigabytes = NULL, next_quota_notes = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
@@ -1508,12 +1510,20 @@ app.post('/api/members/:id/next-quota', async (req, res) => {
 app.put('/api/owners/:id/name', async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, updateVodafone = true } = req.body || {};
-        if (!name || !name.trim()) return res.status(400).json({ success: false, error: 'الاسم الجديد مطلوب' });
+        let { name, updateVodafone = true, syncVodafone } = req.body || {};
+        if (typeof name === 'object' && name !== null) {
+            if (name.syncVodafone !== undefined) updateVodafone = name.syncVodafone;
+            if (name.updateVodafone !== undefined) updateVodafone = name.updateVodafone;
+            name = name.name;
+        }
+        if (syncVodafone !== undefined) updateVodafone = syncVodafone;
+        name = typeof name === 'string' ? name.trim() : '';
+        if (!name) return res.status(400).json({ success: false, error: 'الاسم الجديد مطلوب' });
+
         const owner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [id]);
         if (!owner) return res.status(404).json({ success: false, error: 'الأونر غير موجود' });
 
-        const cleanName = name.trim();
+        const cleanName = name;
         let vfStatus = null;
         if (updateVodafone !== false && owner.password) {
             vfStatus = await updateOwnerNameOnVodafone(owner, cleanName);
@@ -1577,7 +1587,12 @@ app.post('/api/admin/send-renewal-reminders', async (req, res) => {
             message: `تم إرسال ${result.sent} تذكيرات تجديد بنجاح عبر تليجرام 🔔 (تخطي ${result.skippedPaid} أرقام مسددة بالفعل)`,
             sent: result.sent,
             skippedPaid: result.skippedPaid,
-            sentList: result.sentList
+            sentList: result.sentList,
+            data: {
+                sent: result.sent,
+                skippedPaid: result.skippedPaid,
+                sentList: result.sentList
+            }
         });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
