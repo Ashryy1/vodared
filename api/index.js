@@ -158,6 +158,15 @@ async function initDB() {
             sender_name TEXT,
             reject_reason TEXT,
             owner_tg TEXT
+        );`,
+        `CREATE TABLE IF NOT EXISTS admin_notifications (
+            id SERIAL PRIMARY KEY,
+            type TEXT DEFAULT 'invitation_accepted',
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            data JSONB,
+            is_read BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );`
     ];
 
@@ -171,6 +180,7 @@ async function initDB() {
 
     // Add columns individually so NO failure cascades or aborts others
     const columnQueries = [
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS invitation_accepted_at TIMESTAMP;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS plan TEXT;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;`,
@@ -1280,6 +1290,183 @@ async function changeVodafoneOwnerPassword(owner, oldPassword, newPassword) {
     return { success: false, error: errorMsg, raw: respText };
 }
 
+// ============================================ //
+//  SUPER ADMIN NOTIFICATION & INVITATION SYNC  //
+// ============================================ //
+
+async function notifyAdminsOnTelegram(message, options = {}) {
+    try {
+        const botInstance = await getBot();
+        if (!botInstance) return;
+        const admins = await dbAll(`SELECT tg_id FROM bot_admins`).catch(() => []);
+        const adminIds = new Set(['1255885099']);
+        if (Array.isArray(admins)) {
+            for (const a of admins) {
+                if (a.tg_id) adminIds.add(String(a.tg_id).trim());
+            }
+        }
+        for (const chatId of adminIds) {
+            try {
+                await botInstance.sendMessage(chatId, message, { parse_mode: 'Markdown', ...options });
+            } catch (e) {
+                console.warn(`Failed to notify admin ${chatId}:`, e.message);
+            }
+        }
+    } catch (e) {
+        console.error('Error in notifyAdminsOnTelegram:', e.message);
+    }
+}
+
+async function onMemberInvitationAccepted(booking, owner, ownerName, gigabytes, renewalDay) {
+    if (!booking || !booking.id) return;
+    const cleanMemberPhone = displayMsisdn(booking.phone);
+    const cleanOwnerPhone = displayMsisdn(owner?.phone || booking.owner_phone || '');
+    const resolvedOwnerName = ownerName || owner?.name || booking.owner_name || 'الأونر';
+    const resolvedGigs = gigabytes || booking.gigabytes || 20;
+    const resolvedDay = renewalDay || booking.renewal_day || 7;
+
+    console.log(`[INVITATION_ACCEPTED] Member ${cleanMemberPhone} accepted! Notifying Super Admin...`);
+
+    // 1. Update DB booking status to 'متأكتف'
+    try {
+        await dbRun(
+            `UPDATE bookings SET status = 'متأكتف', invitation_accepted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [booking.id]
+        );
+    } catch (e) {
+        console.warn('Could not update booking status:', e.message);
+    }
+
+    // 2. Insert in admin_notifications
+    try {
+        const notifTitle = `🎉 قبول دعوة فودافون للرقم ${cleanMemberPhone}`;
+        const notifMsg = `وافق العميل على الدعوة بنجاح وأصبح الخط مفعلاً في باقة العائلة للأونر ${resolvedOwnerName}. يرجى إبلاغ الفرد وإضافة كلمة المرور.`;
+        const notifData = JSON.stringify({
+            booking_id: booking.id,
+            phone: cleanMemberPhone,
+            owner_phone: cleanOwnerPhone,
+            owner_name: resolvedOwnerName,
+            gigabytes: resolvedGigs,
+            renewal_day: resolvedDay
+        });
+        await dbRun(
+            `INSERT INTO admin_notifications (type, title, message, data, created_at) VALUES ('invitation_accepted', ?, ?, ?, CURRENT_TIMESTAMP)`,
+            [notifTitle, notifMsg, notifData]
+        );
+    } catch (e) {
+        console.warn('Could not insert admin_notification:', e.message);
+    }
+
+    // 3. Send Telegram Notification to Super Admin and all bot admins
+    try {
+        const webAppUrl = (process.env.WEBAPP_URL || 'https://vodared.vercel.app').trim();
+        const adminMsg = 
+`🎉 *إشعار قبول دعوة فودافون ريد جديدة!*
+━━━━━━━━━━━━━━━━━━
+📱 *رقم الفرد:* \`${cleanMemberPhone}\`
+👑 *الأونر التابع له:* *${resolvedOwnerName}* (\`${cleanOwnerPhone}\`)
+📦 *كوتة الباقة:* *${resolvedGigs} GB*
+📅 *يوم التجديد:* يوم *${resolvedDay}*
+
+✅ *حالة الدعوة:* وافق العميل على الدعوة والخط أصبح *مفعلاً ونشطاً* في باقة العائلة.
+
+💡 *المطلوب الآن:*
+1️⃣ التواصل مع الفرد وإبلاغه بتفعيل باقته.
+2️⃣ طلب كلمة سر تطبيق (أنا فودافون) الخاص به وإضافتها في النظام لتفعيل الاستهلاك ومتابعة التجديد.
+
+📌 *يمكنك إضافة الباسورد فوراً من هنا:*
+ارسل في الشات: \`/setpass ${cleanMemberPhone} الباسورد\`
+أو اضغط على الزر بالأسفل لفتح لوحة التحكم:
+━━━━━━━━━━━━━━━━━━`;
+
+        const inlineKeyboard = {
+            inline_keyboard: [
+                [{ text: '🔑 إضافة باسورد الفرد في لوحة التحكم', web_app: { url: webAppUrl } }]
+            ]
+        };
+
+        await notifyAdminsOnTelegram(adminMsg, { reply_markup: inlineKeyboard });
+    } catch (tgErr) {
+        console.warn('Error sending invitation accepted telegram notification:', tgErr.message);
+    }
+}
+
+let isCheckingPendingInvitations = false;
+let lastPendingCheckTime = 0;
+
+async function checkPendingInvitations() {
+    if (isCheckingPendingInvitations) return { skipped: true };
+    const now = Date.now();
+    if (now - lastPendingCheckTime < 25000) return { throttled: true };
+    lastPendingCheckTime = now;
+    isCheckingPendingInvitations = true;
+
+    let acceptedCount = 0;
+    try {
+        const pendingBookings = await dbAll(
+            `SELECT b.*, o.phone AS owner_phone_db, o.password AS owner_password_db, o.name AS owner_name_db
+             FROM bookings b
+             JOIN owners o ON (b.owner_id = o.id OR b.owner_phone = o.phone)
+             WHERE b.status IN ('محجوز', 'معلق') AND b.deleted_at IS NULL`
+        );
+
+        if (!pendingBookings || pendingBookings.length === 0) {
+            isCheckingPendingInvitations = false;
+            return { checked: 0, accepted: 0 };
+        }
+
+        const ownerMap = new Map();
+        for (const pb of pendingBookings) {
+            const oPhone = pb.owner_phone || pb.owner_phone_db;
+            if (!oPhone) continue;
+            if (!ownerMap.has(oPhone)) {
+                ownerMap.set(oPhone, {
+                    owner: {
+                        id: pb.owner_id,
+                        phone: oPhone,
+                        password: pb.owner_password_db,
+                        name: pb.owner_name_db
+                    },
+                    bookings: []
+                });
+            }
+            ownerMap.get(oPhone).bookings.push(pb);
+        }
+
+        for (const [ownerPhone, { owner, bookings }] of ownerMap.entries()) {
+            if (!owner.password) continue;
+            try {
+                const vf = await fastVodafoneCheck(owner.phone, owner.password);
+                if (!vf.valid || !vf.details) continue;
+
+                const familyMembers = vf.details.familyMembers || [];
+                for (const pb of bookings) {
+                    const cleanPhone = displayMsisdn(pb.phone);
+                    const vfMember = familyMembers.find(fm => displayMsisdn(fm.phone) === cleanPhone);
+                    if (vfMember && vfMember.status === 'active') {
+                        acceptedCount++;
+                        await onMemberInvitationAccepted(
+                            pb,
+                            owner,
+                            vf.details.name || owner.name,
+                            vfMember.gigabytes || pb.gigabytes,
+                            vf.details.renewal_day || pb.renewal_day
+                        );
+                    }
+                }
+            } catch (err) {
+                console.warn(`[CHECK_PENDING] Error checking owner ${ownerPhone}:`, err.message);
+            }
+        }
+    } catch (e) {
+        console.error('[CHECK_PENDING] General error:', e.message);
+    } finally {
+        isCheckingPendingInvitations = false;
+    }
+
+    return { checked: true, accepted: acceptedCount };
+}
+
 async function redistributeMemberQuotaOnVodafone(owner, memberPhone, newGB) {
     if (!owner || !owner.phone || !owner.password) return { success: false, error: 'بيانات الأونر غير مكتملة' };
     const cleanMember = displayMsisdn(memberPhone);
@@ -1810,12 +1997,16 @@ app.post('/api/family/sync-live', async (req, res) => {
             for (const m of vfData.familyMembers) {
                 if (!m.phone) continue;
                 const mGigs = m.gigabytes || 20;
-                const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [m.phone]);
+                const existing = await dbGet(`SELECT id, status, phone, gigabytes, renewal_day, name, owner_id, owner_phone FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [m.phone]);
                 if (existing) {
+                    const wasPending = (existing.status === 'محجوز' || existing.status === 'معلق');
                     await dbRun(
                         `UPDATE bookings SET owner_id = ?, owner_phone = ?, owner_name = ?, gigabytes = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
                         [owner.id, owner.phone, resolvedName, mGigs, resolvedRenewalDay, existing.id]
                     );
+                    if (wasPending) {
+                        await onMemberInvitationAccepted(existing, owner, resolvedName, mGigs, resolvedRenewalDay);
+                    }
                 } else {
                     await dbRun(
                         `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
@@ -1915,12 +2106,16 @@ app.post('/api/owners/sync-all', async (req, res) => {
                     for (const m of vfData.familyMembers) {
                         if (!m.phone) continue;
                         const mGigs = m.gigabytes || 20;
-                        const existing = await dbGet(`SELECT id FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [m.phone]);
+                        const existing = await dbGet(`SELECT id, status, phone, gigabytes, renewal_day, name, owner_id, owner_phone FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [m.phone]);
                         if (existing) {
+                            const wasPending = (existing.status === 'محجوز' || existing.status === 'معلق');
                             await dbRun(
                                 `UPDATE bookings SET owner_id = ?, owner_phone = ?, owner_name = ?, gigabytes = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
                                 [owner.id, owner.phone, resolvedName, mGigs, resolvedRenewalDay, existing.id]
                             );
+                            if (wasPending) {
+                                await onMemberInvitationAccepted(existing, owner, resolvedName, mGigs, resolvedRenewalDay);
+                            }
                         } else {
                             await dbRun(
                                 `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
@@ -2198,6 +2393,66 @@ app.post('/api/owners/update-password', async (req, res) => {
 
 app.get('/api/activity', (req, res) => {
     res.json({ success: true, events: [] });
+});
+
+app.get('/api/admin/notifications', async (req, res) => {
+    try {
+        // Fire-and-forget background check for pending invitations
+        checkPendingInvitations().catch(() => {});
+
+        const notifications = await dbAll(
+            `SELECT * FROM admin_notifications ORDER BY id DESC LIMIT 30`
+        ).catch(() => []);
+
+        // Active members whose invitations were accepted but have no password yet
+        const pendingPasswordMembers = await dbAll(
+            `SELECT b.id, b.phone, b.name, b.gigabytes, b.renewal_day, b.invitation_accepted_at, b.created_at, b.updated_at,
+                    b.owner_phone, COALESCE(o.name, b.owner_name) AS owner_name
+             FROM bookings b
+             LEFT JOIN owners o ON (b.owner_id = o.id OR b.owner_phone = o.phone)
+             WHERE b.status = 'متأكتف'
+               AND (b.password IS NULL OR TRIM(b.password) = '')
+               AND b.deleted_at IS NULL
+             ORDER BY b.invitation_accepted_at DESC NULLS LAST, b.updated_at DESC
+             LIMIT 30`
+        ).catch(() => []);
+
+        res.json({
+            success: true,
+            notifications,
+            pendingPasswordMembers
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/admin/notifications/:id/read', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await dbRun(`UPDATE admin_notifications SET is_read = TRUE WHERE id = ?`, [id]);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/admin/notifications/mark-all-read', async (req, res) => {
+    try {
+        await dbRun(`UPDATE admin_notifications SET is_read = TRUE`);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/family/check-invitations', async (req, res) => {
+    try {
+        const result = await checkPendingInvitations();
+        res.json({ success: true, ...result });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // 9. Reset Entire Database (Wipe everything)
@@ -3324,9 +3579,14 @@ async function runDailyTasks() {
 runDailyTasks();
 setInterval(runDailyTasks, 1000 * 60 * 60);
 
+// Automatically check pending member invitations periodically
+setTimeout(() => checkPendingInvitations().catch(() => {}), 5000);
+setInterval(() => checkPendingInvitations().catch(() => {}), 45000);
+
 // Vercel Cron Endpoint:
 app.get('/api/cron', async (req, res) => {
     await runDailyTasks();
+    await checkPendingInvitations().catch(() => {});
     res.json({ success: true, message: 'Cron executed successfully' });
 });
 
@@ -3549,8 +3809,37 @@ function bindBotEvents(bot) {
         }
     });
 
-    // Handle incoming messages for Admin Dashboard (Search by phone)
+    // Handle incoming messages for Admin Dashboard (Search by phone & commands)
     bot.on('message', async (msg) => {
+        if (msg.text && (msg.text.startsWith('/setpass') || msg.text.startsWith('/باسورد') || msg.text.startsWith('/كلمة_السر'))) {
+            if (!(await isAuth(msg))) return;
+            const parts = msg.text.trim().split(/\s+/);
+            if (parts.length < 3) {
+                return bot.sendMessage(msg.chat.id, '⚠️ طريقة الاستخدام:\n`/setpass <رقم_الفرد> <الباسورد>`\n\nمثال:\n`/setpass 01012345678 Pass123$`', { parse_mode: 'Markdown' });
+            }
+            const rawPhone = toEnglish(parts[1]);
+            const targetPhone = displayMsisdn(rawPhone);
+            const newPassword = parts.slice(2).join(' ').trim();
+
+            const booking = await dbGet(`SELECT * FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [targetPhone]);
+            if (!booking) {
+                return bot.sendMessage(msg.chat.id, `❌ لم يتم العثور على فرد مسجل برقم \`${targetPhone}\`.`, { parse_mode: 'Markdown' });
+            }
+
+            await bot.sendMessage(msg.chat.id, `⏳ جاري فحص وتأكيد باسورد أنا فودافون للرقم \`${targetPhone}\`...`, { parse_mode: 'Markdown' });
+            const vf = await fastVodafoneCheck(targetPhone, newPassword);
+            if (!vf.valid) {
+                return bot.sendMessage(msg.chat.id, `❌ الباسورد غير صحيح لدى فودافون:\n${vf.message || 'تأكد من كتابة كلمة المرور الصحيحة'}`);
+            }
+
+            await dbRun(
+                `UPDATE bookings SET password = ?, password_valid = TRUE, password_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                [newPassword, booking.id]
+            );
+
+            return bot.sendMessage(msg.chat.id, `✅ *تم حفظ وتأكيد باسورد الفرد بنجاح! 🎉*\n\n📱 *الرقم:* \`${targetPhone}\`\n🔑 *الباسورد:* \`${newPassword}\`\n✨ أصبح الخط مفعلاً ومتصلاً بالكامل بمتابعة الاستهلاك والتجديد.`, { parse_mode: 'Markdown' });
+        }
+
         if (msg.text && msg.text.startsWith('/')) return;
         if (!(await isAuth(msg))) return;
 
@@ -4936,6 +5225,7 @@ app.get('/api/cron', async (req, res) => {
     // Vercel cron calls this route automatically
     try {
         const reminderResult = await sendDailyRenewalReminders();
+        await checkPendingInvitations().catch(() => {});
         const botInstance = await getBot();
 
         const superAdminId = '1255885099';
