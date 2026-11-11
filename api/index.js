@@ -851,6 +851,10 @@ async function getValidTokenForOwner(owner) {
 
 async function callVodafoneForOwner(owner, url, method = 'GET', body = null) {
     let { token, cookieStr } = await getValidTokenForOwner(owner);
+    const isDxlUrl = String(url || '').includes('/services/dxl/');
+    const refererUrl = (String(url || '').includes('customerGroup') || String(url || '').includes('prepayBalanceManagement'))
+        ? 'https://web.vodafone.com.eg/spa/familySharing'
+        : 'https://web.vodafone.com.eg/spa/myHome';
 
     const headers = {
         'Authorization': `Bearer ${token}`,
@@ -859,11 +863,16 @@ async function callVodafoneForOwner(owner, url, method = 'GET', body = null) {
         'Accept-Language': 'AR',
         'Accept': 'application/json',
         'Content-Type': 'application/json',
-        'Referer': 'https://web.vodafone.com.eg/spa/myHome',
+        'Origin': 'https://web.vodafone.com.eg',
+        'Referer': refererUrl,
         'User-Agent': BROWSER_UA
     };
 
-    if (cookieStr) headers['Cookie'] = cookieStr;
+    // IMPORTANT: Do NOT send F5 BIG-IP /auth cookies (AUTH_SESSION_ID, TS010*) to /services/dxl/* endpoints;
+    // Vodafone's F5 ASM WAF rejects DXL PATCH/mutating requests with status 555 "Request Rejected" when auth cookies are attached.
+    if (!isDxlUrl && cookieStr) {
+        headers['Cookie'] = cookieStr;
+    }
 
     const fetchOpts = { method, headers };
     if (body && method !== 'GET') {
@@ -885,7 +894,8 @@ async function callVodafoneForOwner(owner, url, method = 'GET', body = null) {
                     profile: authRes.profile
                 });
                 headers['Authorization'] = `Bearer ${authRes.token.access_token}`;
-                if (authRes.cookieStr) headers['Cookie'] = authRes.cookieStr;
+                if (!isDxlUrl && authRes.cookieStr) headers['Cookie'] = authRes.cookieStr;
+                else delete headers['Cookie'];
                 resp = await fetch(url, fetchOpts);
                 text = await resp.text();
             }
@@ -925,6 +935,9 @@ function extractVodafoneError(respData, status) {
     if (!raw) return null;
 
     const lower = raw.toLowerCase();
+    if (lower.includes("request rejected") || lower.includes("the requested url was rejected") || lower.includes("<html")) {
+        return "رفضت بوابة الحماية (WAF) في فودافون الطلب مؤقتاً، يرجى المحاولة بعد قليل";
+    }
     if (lower.includes("different billing accounts")) {
         return "رقم الفرد يتبع حساب فواتير مختلف ولا يمكن ضمه لنفس باقة العائلة";
     }
@@ -1194,30 +1207,44 @@ async function removeVodafoneFamilyMember(owner, memberPhone, opts = {}) {
     const executeRemovalAction = async (actionType) => {
         const isCancel = actionType === "CancelInvitation";
         const method = isCancel ? "POST" : "PATCH";
-        const parts = {
-            member: [
-                { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
-                { id: [{ value: ctx.matchedMember?.id?.[0]?.value || formattedMember, schemeName: "MSISDN" }], type: "Member" }
-            ]
-        };
-        if (!isCancel) {
-            parts.characteristicsValue = {
-                characteristicsValue: [
-                    { characteristicName: "Disconnect", value: "0" },
-                    { characteristicName: "LastMemberDeletion", value: "1" }
+        const memberIdVal = ctx.matchedMember?.id?.[0]?.value || formattedMember;
+        const primaryOwnerVal = ctx.ownerMember?.id?.[0]?.value || formattedOwner;
+
+        const sendRemoval = async (ownerVal) => {
+            const parts = {
+                member: [
+                    { id: [{ value: ownerVal, schemeName: "MSISDN" }], type: "Owner" },
+                    { id: [{ value: memberIdVal, schemeName: "MSISDN" }], type: "Member" }
                 ]
             };
-        }
+            if (!isCancel) {
+                parts.characteristicsValue = {
+                    characteristicsValue: [
+                        { characteristicName: "Disconnect", value: "0" },
+                        { characteristicName: "LastMemberDeletion", value: "1" }
+                    ]
+                };
+            }
 
-        const payload = {
-            name: ctx.roleName,
-            type: actionType,
-            category: [ctx.templateCategory],
-            parts
+            const payload = {
+                name: ctx.roleName,
+                type: actionType,
+                category: [ctx.templateCategory],
+                parts
+            };
+
+            console.log(`[REMOVE_MEMBER] Owner ${ownerVal} -> ${method} ${actionType} (${ctx.roleName}, tpl=${ctx.templateCategory?.value}) for member ${memberIdVal}...`);
+            return await callVodafoneForOwner(owner, VODAFONE_CUSTOMER_GROUP_URL, method, payload);
         };
 
-        console.log(`[REMOVE_MEMBER] Owner ${cleanOwnerPhone} -> ${method} ${actionType} (${ctx.roleName}, tpl=${ctx.templateCategory?.value}) for member ${cleanMemberPhone}...`);
-        const resp = await callVodafoneForOwner(owner, VODAFONE_CUSTOMER_GROUP_URL, method, payload);
+        let resp = await sendRemoval(primaryOwnerVal);
+        if (!resp.ok && (resp.status === 400 || resp.status === 404)) {
+            console.log(`[REMOVE_MEMBER] Retrying with 11-digit owner MSISDN (${cleanOwnerPhone}) after status ${resp.status}...`);
+            const retryResp = await sendRemoval(cleanOwnerPhone);
+            if (retryResp.ok || retryResp.status === 200 || retryResp.status === 201 || retryResp.status === 204 || retryResp.status !== 404) {
+                resp = retryResp;
+            }
+        }
 
         if (resp.ok || resp.status === 200 || resp.status === 201 || resp.status === 204) {
             return { success: true, result: resp.data };
