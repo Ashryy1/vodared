@@ -12,6 +12,13 @@
     <link rel="stylesheet" href="style.css?v=2">
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        #viewLogin[style*="display: none"],
+        #viewAdminNew[style*="display: none"],
+        #viewCustomer[style*="display: none"] {
+            display: none !important;
+        }
+    </style>
 </head>
 
 <body>
@@ -34,20 +41,20 @@
 
     <!-- ============ LOGIN VIEW ============ -->
     <div id="viewLogin" class="login-view" style="display: none; padding: 0; min-height: 100vh; position: relative;">
-        <iframe src="login.html" id="loginIframe"
-            style="width: 100%; height: 100vh; border: none; overflow: hidden; background: black;"></iframe>
+        <iframe src="login.html?v=12" id="loginIframe"
+            style="display: block; width: 100%; height: 100vh; height: 100dvh; border: none; background: black;"></iframe>
     </div>
 
     <!-- ============ NEW ADMIN DASHBOARD ============ -->
     <div id="viewAdminNew" style="display:none">
-        <iframe src="admin-ui.html?v=11" id="adminNewIframe"
-            style="width: 100%; height: 100vh; border: none; overflow: hidden; background: #0A0A0C;"></iframe>
+        <iframe src="admin-ui.html?v=12" id="adminNewIframe"
+            style="display: block; width: 100%; height: 100vh; height: 100dvh; border: none; background: #0A0A0C;"></iframe>
     </div>
 
     <!-- ============ CUSTOMER DASHBOARD ============ -->
     <div id="viewCustomer" style="display:none">
-        <iframe src="customer.html?v=9" id="customerIframe"
-            style="width: 100%; height: 100vh; border: none; overflow: hidden; background: black;"></iframe>
+        <iframe src="customer.html?v=12" id="customerIframe"
+            style="display: block; width: 100%; height: 100vh; height: 100dvh; border: none; background: black;"></iframe>
     </div>
 
     <!-- New Booking Registration Modal -->
@@ -244,7 +251,7 @@
     <!-- Toast -->
     <div id="toast" class="toast"></div>
 
-    <script src="app.js?v=7"></script>
+    <script src="app.js?v=12"></script>
 
 </body>
 </html>

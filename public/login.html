@@ -20,12 +20,13 @@
 
         body {
             margin: 0;
-            padding: 20px 0;
+            padding: 24px 0;
             min-height: 100vh;
+            min-height: 100dvh;
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
+            justify-content: flex-start;
             background: var(--bg);
             font-family: 'Tajawal', sans-serif;
             color: #fff;
@@ -88,7 +89,7 @@
             display: flex;
             flex-direction: column;
             gap: 24px;
-            margin: 20px;
+            margin: auto 16px 12px 16px;
             animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
             opacity: 0;
             transform: translateY(30px);
@@ -367,22 +368,49 @@
         </button>
     </div>
 
-    
+    <!-- Developer Footer -->
+    <footer class="developer-footer" style="position: relative; z-index: 10; margin: 20px auto 24px auto; padding: 15px; text-align: center; width: 100%; max-width: 400px; box-sizing: border-box; font-family: 'Tajawal', sans-serif;">
+        <div style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 8px; opacity: 0.5;">
+            <div style="height: 1px; flex: 1; background: linear-gradient(to right, transparent, rgba(255,255,255,0.2));"></div>
+            <span style="color: #999; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 2px; font-weight: 600;">Designed &amp; Developed by</span>
+            <div style="height: 1px; flex: 1; background: linear-gradient(to left, transparent, rgba(255,255,255,0.2));"></div>
+        </div>
+        <div style="color: #ffffff; font-size: 1.05rem; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 12px;">
+            Hossam Ashour
+        </div>
+        <div style="display: flex; justify-content: center; align-items: center; gap: 14px;">
+            <a href="https://wa.me/201101925305" target="_blank" rel="noopener noreferrer" style="color: #25D366; background: rgba(37,211,102,0.1); border: 1px solid rgba(37,211,102,0.25); width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; text-decoration: none; font-size: 1.2rem; transition: transform 0.2s;" title="WhatsApp"><i class='bx bxl-whatsapp'></i></a>
+            <a href="https://t.me/hossam_ashourr" target="_blank" rel="noopener noreferrer" style="color: #0088cc; background: rgba(0,136,204,0.1); border: 1px solid rgba(0,136,204,0.25); width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; text-decoration: none; font-size: 1.2rem; transition: transform 0.2s;" title="Telegram"><i class='bx bxl-telegram'></i></a>
+            <a href="https://www.facebook.com/share/19EWBmqJKF/" target="_blank" rel="noopener noreferrer" style="color: #1877F2; background: rgba(24,119,242,0.1); border: 1px solid rgba(24,119,242,0.25); width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; text-decoration: none; font-size: 1.2rem; transition: transform 0.2s;" title="Facebook"><i class='bx bxl-facebook'></i></a>
+            <a href="https://www.instagram.com/hossam_ashourr" target="_blank" rel="noopener noreferrer" style="color: #E4405F; background: rgba(228,64,95,0.1); border: 1px solid rgba(228,64,95,0.25); width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; text-decoration: none; font-size: 1.2rem; transition: transform 0.2s;" title="Instagram"><i class='bx bxl-instagram'></i></a>
+        </div>
+    </footer>
 
     <script>
         async function doLogin() {
-            const phone = document.getElementById('phone').value.trim();
+            let phone = document.getElementById('phone').value.trim();
             const pass = document.getElementById('password').value.trim();
             const err = document.getElementById('errorMsg');
             const btn = document.getElementById('btnLogin');
 
+            const arabicNumbers = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
+            phone = phone.replace(/[٠-٩]/g, d => arabicNumbers.indexOf(d)).replace(/[\s-]/g, '');
+
             if (!phone) {
                 err.style.display = 'block';
+                err.style.background = 'rgba(255, 0, 0, 0.1)';
+                err.style.border = '1px solid rgba(255, 0, 0, 0.2)';
+                err.style.padding = '12px';
+                err.style.textAlign = 'center';
                 err.innerHTML = 'يرجى إدخال رقم الهاتف أو الـ ID';
                 return;
             }
             if (phone !== '1255885099' && !pass) {
                 err.style.display = 'block';
+                err.style.background = 'rgba(255, 0, 0, 0.1)';
+                err.style.border = '1px solid rgba(255, 0, 0, 0.2)';
+                err.style.padding = '12px';
+                err.style.textAlign = 'center';
                 err.innerHTML = 'يرجى إدخال كلمة المرور';
                 return;
             }
@@ -392,16 +420,45 @@
             btn.innerHTML = '<i class="bx bx-loader-alt bx-spin"></i> جاري الدخول...';
 
             try {
-                if (window.parent && window.parent.performAPIUnifiedLogin) {
-                    const res = await window.parent.performAPIUnifiedLogin(phone, pass);
-                    if (res.success) {
+                let res = null;
+                if (window.parent && window.parent !== window && window.parent.performAPIUnifiedLogin) {
+                    res = await window.parent.performAPIUnifiedLogin(phone, pass);
+                } else {
+                    const r = await fetch('/api/customer/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ phone, password: pass })
+                    });
+                    const j = await r.json();
+                    if (j.success) {
+                        try {
+                            let accs = JSON.parse(localStorage.getItem('customerAccounts') || '[]');
+                            if (!Array.isArray(accs)) accs = [];
+                            if (!accs.some(x => x.phone === phone)) {
+                                accs.push({ id: j.data && !j.is_owner ? j.data.id : undefined, phone, password: pass, is_owner: Boolean(j.is_owner) });
+                                localStorage.setItem('customerAccounts', JSON.stringify(accs));
+                            }
+                        } catch (_) {}
+                        res = { success: true, switchTo: 'customer' };
+                    } else {
+                        res = { success: false, error: j.error, not_found: Boolean(j.not_found), canRegister: Boolean(j.not_found) };
+                    }
+                }
+
+                if (res && res.success) {
+                    if (window.parent && window.parent !== window && window.parent.switchView) {
                         window.parent.switchView(res.switchTo);
                     } else {
-                        err.style.display = 'block';
-                        err.style.textAlign = 'right';
-                        err.style.background = 'transparent';
-                        err.style.border = 'none';
-                        err.style.padding = '0';
+                        window.location.href = 'customer.html?v=12';
+                    }
+                } else {
+                    err.style.display = 'block';
+                    err.style.textAlign = 'right';
+                    err.style.background = 'transparent';
+                    err.style.border = 'none';
+                    err.style.padding = '0';
+
+                    if (res && res.not_found) {
                         err.innerHTML = `
                             <div style="background: rgba(255,8,68,0.1); border: 1px solid rgba(255,8,68,0.3); border-radius: 12px; padding: 12px; margin-bottom: 12px;">
                                 <h4 style="margin: 0 0 4px 0; color: #ff0844; font-size: 1rem;"><i class='bx bx-error-circle'></i> الرقم غير مسجل</h4>
@@ -420,14 +477,23 @@
                                 </button>
                             </div>
                         `;
+                    } else {
+                        err.innerHTML = `
+                            <div style="background: rgba(255,8,68,0.12); border: 1px solid rgba(255,8,68,0.35); border-radius: 12px; padding: 14px; margin-bottom: 12px;">
+                                <h4 style="margin: 0 0 4px 0; color: #ff0844; font-size: 0.98rem; font-weight: bold;"><i class='bx bx-error-circle'></i> ${res && res.error ? res.error : 'كلمة المرور غير صحيحة لدى فودافون'}</h4>
+                                <p style="margin: 4px 0 0 0; color: #e8eaed; font-size: 0.82rem;">يرجى التأكد من باسورد أنا فودافون للخط والمحاولة مرة أخرى.</p>
+                            </div>
+                            <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; padding: 10px; text-align: center;">
+                                <a href="https://t.me/hak_alqulub" target="_blank" style="display: flex; align-items: center; justify-content: center; gap: 6px; color: #0088cc; text-decoration: none; font-size: 0.85rem; font-weight: bold;">
+                                    <i class='bx bxl-telegram'></i> هل نسيت الباسورد؟ تواصل مع الدعم الفني
+                                </a>
+                            </div>
+                        `;
                     }
-                } else {
-                    err.style.display = 'block';
-                    err.innerHTML = 'خطأ: لم يتم التعرف على النظام';
                 }
             } catch (e) {
                 err.style.display = 'block';
-                err.innerHTML = 'حدث خطأ غير متوقع';
+                err.innerHTML = 'حدث خطأ غير متوقع في الاتصال بالخادم';
             }
 
             btn.classList.remove('loading');

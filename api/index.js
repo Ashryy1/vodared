@@ -4089,22 +4089,29 @@ function bindBotEvents(bot) {
 // Customer login: authenticate by phone + vodafone password
 app.post('/api/customer/login', async (req, res) => {
     try {
-        const { phone, password, booking_id, tg_id, tg_username } = req.body;
+        let { phone, password, booking_id, tg_id, tg_username } = req.body || {};
+        phone = phone ? toEnglish(String(phone).trim().replace(/[\s-]/g, '')) : '';
+        password = password ? String(password).trim() : '';
         if ((!phone || !password) && !booking_id) return res.status(400).json({ success: false, error: 'البيانات مطلوبة' });
 
         let booking = null;
-        if (booking_id) {
-            booking = await dbGet(`SELECT * FROM bookings WHERE id = ? AND deleted_at IS NULL`, [booking_id]);
-        } else {
-            booking = await dbGet(`SELECT * FROM bookings WHERE phone = ? AND password = ? AND deleted_at IS NULL`, [phone.trim(), password.trim()]);
+        if (booking_id && !req.body.is_owner) {
+            if (phone) {
+                booking = await dbGet(`SELECT * FROM bookings WHERE id = ? AND phone = ? AND deleted_at IS NULL`, [booking_id, phone]);
+            } else {
+                booking = await dbGet(`SELECT * FROM bookings WHERE id = ? AND deleted_at IS NULL`, [booking_id]);
+            }
+        }
+        if (!booking && phone && password) {
+            booking = await dbGet(`SELECT * FROM bookings WHERE phone = ? AND password = ? AND deleted_at IS NULL`, [phone, password]);
         }
 
         if (!booking) {
             // Check if there's a pending first_time payment for this phone
-            const pendingReg = await dbGet(
+            const pendingReg = phone ? await dbGet(
                 `SELECT * FROM customer_payments WHERE phone = ? AND payment_type = 'first_time' AND status IN ('pending', 'needs_review')`,
-                [phone.trim()]
-            );
+                [phone]
+            ) : null;
             if (pendingReg) {
                 return res.json({
                     success: true,
@@ -4127,30 +4134,32 @@ app.post('/api/customer/login', async (req, res) => {
             }
 
             // Check if the phone is registered at all
-            const bExists = await dbGet(`SELECT * FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [phone.trim()]);
+            const bExists = phone ? await dbGet(`SELECT * FROM bookings WHERE phone = ? AND deleted_at IS NULL`, [phone]) : null;
             if (bExists) {
                 // Verify password against Vodafone directly
-                const vf = await fastVodafoneCheck(phone.trim(), password.trim());
+                const vf = await fastVodafoneCheck(phone, password);
                 if (vf.valid) {
                     const vfName = vf.details?.name || null;
                     if (vfName) {
-                        await dbRun(`UPDATE bookings SET password = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [password.trim(), vfName, bExists.id]);
+                        await dbRun(`UPDATE bookings SET password = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [password, vfName, bExists.id]);
                     } else {
-                        await dbRun(`UPDATE bookings SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [password.trim(), bExists.id]);
+                        await dbRun(`UPDATE bookings SET password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [password, bExists.id]);
                     }
                     booking = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [bExists.id]);
                 } else {
-                    return res.status(401).json({ success: false, error: vf.message || 'كلمة المرور غير صحيحة لدى فودافون.' });
+                    return res.status(401).json({ success: false, not_found: false, error: vf.message || 'كلمة المرور غير صحيحة لدى فودافون.' });
                 }
             } else {
                 // Check if Owner logged in with owner credentials
-                const owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [phone.trim()]);
+                const owner = phone ? await dbGet(`SELECT * FROM owners WHERE phone = ?`, [phone]) : null;
                 if (owner) {
-                    let ownerValid = (owner.password === password.trim());
-                    if (!ownerValid) {
-                        const vf = await fastVodafoneCheck(phone.trim(), password.trim());
+                    let ownerValid = (owner.password === password);
+                    let vfMsg = null;
+                    if (!ownerValid && password) {
+                        const vf = await fastVodafoneCheck(phone, password);
+                        vfMsg = vf.message;
                         if (vf.valid) {
-                            await dbRun(`UPDATE owners SET password = ? WHERE id = ?`, [password.trim(), owner.id]);
+                            await dbRun(`UPDATE owners SET password = ? WHERE id = ?`, [password, owner.id]);
                             ownerValid = true;
                         }
                     }
@@ -4169,6 +4178,7 @@ app.post('/api/customer/login', async (req, res) => {
                             }
                         });
                     }
+                    return res.status(401).json({ success: false, not_found: false, error: vfMsg || 'كلمة المرور غير صحيحة لدى فودافون.' });
                 }
                 return res.status(401).json({ success: false, error: 'الرقم غير مسجل في النظام.', not_found: true });
             }

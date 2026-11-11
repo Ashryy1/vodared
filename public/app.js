@@ -87,9 +87,26 @@ function getNextPaymentDateText(latestPaidMonth, renewalDay) {
     return `${renewalDay} ${names[m - 1]} ${y}`;
 }
 
+let livePackagePrices = null;
+async function loadLivePackagePrices() {
+    if (livePackagePrices) return livePackagePrices;
+    try {
+        const r = await fetch(`${API}/api/settings/package-prices`);
+        const j = await r.json();
+        if (j.success && j.data) {
+            livePackagePrices = j.data;
+            return livePackagePrices;
+        }
+    } catch (_) {}
+    return null;
+}
 function getPackagePrice(gigs) {
-    const prices = { 20: 250, 30: 350, 40: 450, 60: 600, 70: 700, 85: 800 };
-    return prices[parseInt(gigs)] || 'غير محدد';
+    const g = parseInt(gigs);
+    if (livePackagePrices && livePackagePrices[g] !== undefined) {
+        return Number(livePackagePrices[g]);
+    }
+    const prices = { 20: 250, 30: 350, 40: 450, 50: 550, 60: 600, 70: 700, 85: 800 };
+    return prices[g] || 'غير محدد';
 }
 
 // Auth State
@@ -140,6 +157,7 @@ function switchView(view) {
 
 // ===== INIT =====
 document.addEventListener('DOMContentLoaded', () => {
+    loadLivePackagePrices();
     initAuth();
 });
 
@@ -226,7 +244,13 @@ async function showCustomerLogin() {
 }
 
 // Iframe integration API
+function normalizePhoneDigits(str) {
+    const arabic = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
+    return String(str || '').replace(/[٠-٩]/g, d => arabic.indexOf(d)).replace(/[\s-]/g, '');
+}
+
 window.performAPIUnifiedLogin = async function (ident, pass) {
+    ident = normalizePhoneDigits(ident);
     if (!ident) return { success: false, error: 'أدخل الرقم أو الـ ID' };
 
     try {
@@ -268,19 +292,23 @@ window.performAPIUnifiedLogin = async function (ident, pass) {
                 });
             }
             const b = jLogin.data;
-            if (b.id) {
-                if (!window.customerAccounts.some(x => x.id === b.id)) {
+            if (b.id && !jLogin.is_owner) {
+                if (!window.customerAccounts.some(x => x.id === b.id || x.phone === ident)) {
                     window.customerAccounts.push({ id: b.id, phone: ident, password: pass });
                 }
             } else if (!window.customerAccounts.some(x => x.phone === ident)) {
-                window.customerAccounts.push({ phone: ident, password: pass });
+                window.customerAccounts.push({ phone: ident, password: pass, is_owner: Boolean(jLogin.is_owner) });
             }
             localStorage.setItem('customerAccounts', JSON.stringify(window.customerAccounts));
             return { success: true, switchTo: 'customer' };
         }
 
-        // 3. Not found - offer registration
-        return { success: false, error: 'الرقم مش مسجل عندنا. لو عايز تحجز اضغط "حجز جديد"', canRegister: true };
+        return {
+            success: false,
+            error: jLogin.error || 'فشل تسجيل الدخول',
+            not_found: Boolean(jLogin.not_found),
+            canRegister: Boolean(jLogin.not_found)
+        };
     } catch (e) {
         return { success: false, error: 'خطأ في الشبكة' };
     }
@@ -340,7 +368,7 @@ let currentRegPhone = '';
 let currentRegPassword = '';
 
 window.submitRegisterVerify = async function () {
-    const phone = document.getElementById('regPhone').value.trim();
+    const phone = normalizePhoneDigits(document.getElementById('regPhone').value.trim());
     const password = document.getElementById('regPassword').value.trim();
     if (!phone || !password) {
         showToast('يرجى إدخال الرقم والباسورد', 'error');
@@ -487,26 +515,31 @@ window.performAPIFirstTimePayment = async function (data) {
 
 // ===== CUSTOMER DASHBOARD (Iframe Integration) =====
 window.performAPIGetCustomerLines = async function () {
+    await loadLivePackagePrices();
     let lines = [];
     for (const acc of window.customerAccounts) {
         try {
             const r = await fetch(`${API}/api/customer/login`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ phone: acc.phone, password: acc.password })
+                body: JSON.stringify({ phone: acc.phone, password: acc.password, booking_id: acc.id, is_owner: Boolean(acc.is_owner) })
             });
             const j = await r.json();
-            if (j.success) {
+            if (j.success && j.data) {
                 const b = j.data;
+                const priceVal = getPackagePrice(b.gigabytes);
                 lines.push({
-                    id: b.id.toString(),
+                    id: b.id ? String(b.id) : ('pending-' + (b.phone || Math.random())),
                     phone: b.phone,
                     bundle: b.gigabytes ? `${b.gigabytes} جيجا` : 'فودافون ريد',
                     gigabytes: b.gigabytes || 0,
-                    amount: getPackagePrice(b.gigabytes) !== 'غير محدد' ? getPackagePrice(b.gigabytes) : 0,
+                    amount: priceVal !== 'غير محدد' ? priceVal : 0,
                     renewalDay: b.renewal_day || 1,
-                    paid: b.paid_this_month,
-                    status: (b.status === 'قيد الانتظار' || b.status === 'محجوز') ? 'suspended' : 'active'
+                    paid: Boolean(b.paid_this_month),
+                    status: (b.status === 'قيد الانتظار' || b.status === 'محجوز') ? 'suspended' : 'active',
+                    pendingPayment: b.pending_payment || null,
+                    latestPayment: b.latest_payment || null,
+                    isPendingRegistration: Boolean(b.is_pending_registration)
                 });
             }
         } catch (e) { }
@@ -779,7 +812,7 @@ function refreshCustomerData() {
 
 function logoutCustomer(phone) {
     window.customerAccounts = window.customerAccounts.filter(x => x.phone !== phone);
-    localStorage.setItem('window.customerAccounts', JSON.stringify(window.customerAccounts));
+    localStorage.setItem('customerAccounts', JSON.stringify(window.customerAccounts));
     if (window.customerAccounts.length === 0) {
         showCustomerLogin();
     } else {
@@ -802,6 +835,7 @@ async function fetchSettings() {
 }
 
 async function openPaymentModal(bookingId, phone, gigabytes, renewalDay) {
+    await loadLivePackagePrices();
     paymentBookingId = bookingId;
     window.currentPaymentContext = { type: 'renewal', booking_id: bookingId, phone: phone };
 
@@ -854,7 +888,7 @@ async function openPaymentModal(bookingId, phone, gigabytes, renewalDay) {
             const lr = await fetch(`${API}/api/customer/login`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ phone: foundAcc.phone, password: foundAcc.password })
+                body: JSON.stringify({ phone: foundAcc.phone, password: foundAcc.password, booking_id: foundAcc.id, is_owner: Boolean(foundAcc.is_owner) })
             });
             const lj = await lr.json();
             if (lj.success) lineAccountInfo = lj.data;
@@ -1163,7 +1197,13 @@ async function submitPayment() {
             }
 
             if (!isFirstTime && window.userRole === 'customer') {
-                setTimeout(refreshCustomerData, 2000);
+                setTimeout(() => {
+                    refreshCustomerData();
+                    const custFrame = document.getElementById('customerIframe');
+                    if (custFrame && custFrame.contentWindow) {
+                        try { custFrame.contentWindow.postMessage({ type: 'REFRESH_LINES' }, '*'); } catch (_) {}
+                    }
+                }, 1000);
             }
             startVerificationPolling(j.payment_id);
         } else {
