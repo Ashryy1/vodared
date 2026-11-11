@@ -1093,51 +1093,108 @@ async function sendVodafoneFamilyInvitation(owner, memberPhone, quotaGB, minutes
     return { success: false, error: err || `فشل إرسال الدعوة بكود ${resp.status}` };
 }
 
-async function removeVodafoneFamilyMember(owner, memberPhone) {
+async function removeVodafoneFamilyMember(owner, memberPhone, opts = {}) {
     const cleanMemberPhone = displayMsisdn(memberPhone);
     const cleanOwnerPhone = displayMsisdn(owner.phone);
     const formattedMember = `20${cleanMemberPhone.replace(/^0/, '')}`;
     const formattedOwner = `20${cleanOwnerPhone.replace(/^0/, '')}`;
+    const customerGroupUrl = "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup";
 
+    const planLower = (owner.plan || "").toLowerCase();
     let roleName = "EnterpriseRedFamily";
-    if (owner.plan && owner.plan.toLowerCase().includes("flex")) {
+    if (planLower.includes("flex")) {
         roleName = "FlexFamily";
+    } else if (planLower.includes("red") && !planLower.includes("business") && !planLower.includes("enterprise")) {
+        roleName = "RedFamily";
+    }
+    let templateCategory = { value: "880", listHierarchyId: "TemplateID" };
+    let vodafoneStatus = null;
+    let inquiryConfirmedMembers = false;
+
+    // Query live Vodafone family state to resolve exact roleName, TemplateID, and active vs pending status
+    try {
+        const inquiryResp = await callVodafoneForOwner(
+            owner,
+            `${customerGroupUrl}?type=Family&$.parts.member.type=owner`,
+            "GET"
+        );
+        const fg = Array.isArray(inquiryResp.data) ? inquiryResp.data[0] : inquiryResp.data;
+        if (inquiryResp.ok && fg && typeof fg === "object") {
+            if (fg.name) roleName = fg.name;
+            if (Array.isArray(fg.category) && fg.category.length > 0) {
+                templateCategory = fg.category.find(c => c && c.listHierarchyId === "TemplateID") || fg.category[0];
+            }
+            if (Array.isArray(fg.parts?.member)) {
+                inquiryConfirmedMembers = true;
+                const matched = fg.parts.member.find(m => {
+                    const mPhone = displayMsisdn(m?.id?.[0]?.value);
+                    return mPhone === cleanMemberPhone && String(m?.type || "").toLowerCase() !== "owner";
+                });
+                if (!matched) {
+                    console.log(`[REMOVE_MEMBER] Member ${cleanMemberPhone} is already absent from owner ${cleanOwnerPhone} family on Vodafone.`);
+                    return { success: true, alreadyRemoved: true };
+                }
+                vodafoneStatus = String(matched.status || "");
+            }
+        }
+    } catch (inqErr) {
+        console.warn(`[REMOVE_MEMBER] familyInquiry pre-check warning for ${cleanOwnerPhone}:`, inqErr.message);
     }
 
-    const payload = {
-        name: roleName,
-        type: "FamilyRemoveMember",
-        category: [{ value: "880", listHierarchyId: "TemplateID" }],
-        parts: {
+    const executeRemovalAction = async (actionType) => {
+        const isCancel = actionType === "CancelInvitation";
+        const method = isCancel ? "POST" : "PATCH";
+        const parts = {
             member: [
                 { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
                 { id: [{ value: formattedMember, schemeName: "MSISDN" }], type: "Member" }
-            ],
-            characteristicsValue: {
+            ]
+        };
+        if (!isCancel) {
+            parts.characteristicsValue = {
                 characteristicsValue: [
                     { characteristicName: "Disconnect", value: "0" },
                     { characteristicName: "LastMemberDeletion", value: "1" }
                 ]
-            }
+            };
         }
-    };
 
-    console.log(`[REMOVE_MEMBER] Owner ${cleanOwnerPhone} removing member ${cleanMemberPhone} from Vodafone...`);
-    const resp = await callVodafoneForOwner(
-        owner,
-        "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup",
-        "POST",
-        payload
-    );
+        const payload = {
+            name: roleName,
+            type: actionType,
+            category: [templateCategory],
+            parts
+        };
 
-    const err = extractVodafoneError(resp.data, resp.status);
-    if (!resp.ok && resp.status !== 200 && resp.status !== 201 && err) {
-        if (/not found|لا توجد|already|غير موجود/i.test(err)) {
+        console.log(`[REMOVE_MEMBER] Owner ${cleanOwnerPhone} -> ${method} ${actionType} (${roleName}, tpl=${templateCategory?.value}) for member ${cleanMemberPhone}...`);
+        const resp = await callVodafoneForOwner(owner, customerGroupUrl, method, payload);
+
+        if (resp.ok || resp.status === 200 || resp.status === 201 || resp.status === 204) {
+            return { success: true, result: resp.data };
+        }
+        const err = extractVodafoneError(resp.data, resp.status) || `فشل الطلب مع كود ${resp.status}`;
+        if (/not found|لا توجد|already|غير موجود|not a member/i.test(err)) {
             return { success: true, alreadyRemoved: true };
         }
         return { success: false, error: err };
+    };
+
+    const isPending = vodafoneStatus !== null
+        ? vodafoneStatus === "5"
+        : Boolean(opts.isPendingInvite);
+
+    const primaryAction = isPending ? "CancelInvitation" : "FamilyRemoveMember";
+    const primaryRes = await executeRemovalAction(primaryAction);
+    if (primaryRes.success) return primaryRes;
+
+    // If familyInquiry wasn't conclusive, try the alternate action in case DB status differed from Vodafone's state
+    if (!inquiryConfirmedMembers) {
+        const fallbackAction = isPending ? "FamilyRemoveMember" : "CancelInvitation";
+        const fallbackRes = await executeRemovalAction(fallbackAction);
+        if (fallbackRes.success) return fallbackRes;
     }
-    return { success: true, result: resp.data };
+
+    return primaryRes;
 }
 
 async function updateOwnerNameOnVodafone(owner, newName) {
@@ -1719,7 +1776,11 @@ async function handleDeleteMember(req, res) {
         }
 
         if (owner && owner.password) {
-            const remRes = await removeVodafoneFamilyMember(owner, memberPhone);
+            const isPendingInvite =
+                member?.status === 'محجوز' ||
+                member?.status === 'قيد الانتظار' ||
+                String(req.path || '').includes('cancel-invite');
+            const remRes = await removeVodafoneFamilyMember(owner, memberPhone, { isPendingInvite });
             if (!remRes.success) {
                 return res.status(400).json({
                     success: false,
