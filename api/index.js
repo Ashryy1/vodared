@@ -761,6 +761,30 @@ function displayMsisdn(m) {
     return s;
 }
 
+function extractMsisdnFromVodafoneMember(rm) {
+    if (!rm) return '';
+    const ids = Array.isArray(rm.id) ? rm.id : (rm.id ? [rm.id] : []);
+    for (const item of ids) {
+        if (String(item?.schemeName || '').toUpperCase() === 'MSISDN') {
+            const d = displayMsisdn(item.value);
+            if (d && d.length === 11 && d.startsWith('01')) return d;
+        }
+    }
+    for (const item of ids) {
+        const d = displayMsisdn(item?.value);
+        if (d && d.length === 11 && d.startsWith('01')) return d;
+    }
+    if (rm.msisdn) {
+        const d = displayMsisdn(rm.msisdn);
+        if (d && d.length === 11 && d.startsWith('01')) return d;
+    }
+    if (rm.phone) {
+        const d = displayMsisdn(rm.phone);
+        if (d && d.length === 11 && d.startsWith('01')) return d;
+    }
+    return '';
+}
+
 function extractVodafoneCookies(resp, cookieMap) {
     const getSetCookie = resp.headers.getSetCookie;
     let rawCookies = [];
@@ -1774,13 +1798,13 @@ async function syncOwnerFamilyMembersToDb(ownerObj, vfData, resolvedName, resolv
             const cleanM = displayMsisdn(m.phone);
             const mGigs = m.gigabytes || 20;
             const existing = await dbGet(
-                `SELECT id, status, phone, gigabytes, renewal_day, name, owner_id, owner_phone FROM bookings WHERE phone = ? AND deleted_at IS NULL`,
+                `SELECT id, status, phone, gigabytes, renewal_day, name, owner_id, owner_phone, deleted_at FROM bookings WHERE phone = ?`,
                 [cleanM]
             );
             if (existing) {
                 const wasPending = (existing.status === 'محجوز' || existing.status === 'معلق');
                 await dbRun(
-                    `UPDATE bookings SET owner_id = ?, owner_phone = ?, owner_name = COALESCE(?, owner_name), gigabytes = ?, megabytes = ?, voice_minutes = ?, sms_count = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    `UPDATE bookings SET deleted_at = NULL, owner_id = ?, owner_phone = ?, owner_name = COALESCE(?, owner_name), gigabytes = ?, megabytes = ?, voice_minutes = ?, sms_count = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
                     [ownerObj.id, ownerPhone, resolvedName || null, mGigs, m.megabytes || (mGigs * 1024), m.voice || 0, m.sms || 0, resolvedRenewalDay, existing.id]
                 );
                 if (wasPending) {
@@ -1797,28 +1821,21 @@ async function syncOwnerFamilyMembersToDb(ownerObj, vfData, resolvedName, resolv
         }
     }
 
-    if (vfData?.familyInquiryOk) {
-        const livePhones = new Set([
-            ...syncedPhones,
-            ...(vfData.pendingInvites || []).map(p => displayMsisdn(p.phone)).filter(Boolean)
-        ]);
-        const inactiveSet = new Set((vfData.inactiveMembers || []).map(p => displayMsisdn(p.phone)).filter(Boolean));
-        const dbMembers = await dbAll(
-            `SELECT id, phone, status, created_at FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL`,
-            [ownerObj.id, ownerPhone]
-        );
-        for (const b of dbMembers) {
-            const cleanB = displayMsisdn(b.phone);
-            if (!cleanB || livePhones.has(cleanB)) continue;
-            const isPendingRow = (b.status === 'محجوز' || b.status === 'معلق');
-            const ageMs = b.created_at ? (Date.now() - new Date(b.created_at).getTime()) : Infinity;
-            if (!isPendingRow || inactiveSet.has(cleanB) || ageMs > 60000) {
+    // Also sync pending invites so they appear in waiting lists
+    if (Array.isArray(vfData?.pendingInvites)) {
+        for (const p of vfData.pendingInvites) {
+            if (!p.phone) continue;
+            const cleanP = displayMsisdn(p.phone);
+            const pExisting = await dbGet(`SELECT id, status, deleted_at FROM bookings WHERE phone = ?`, [cleanP]);
+            if (pExisting) {
+                if (pExisting.deleted_at) {
+                    await dbRun(`UPDATE bookings SET deleted_at = NULL, owner_id = ?, owner_phone = ?, owner_name = COALESCE(?, owner_name), status = 'محجوز', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [ownerObj.id, ownerPhone, resolvedName || null, pExisting.id]);
+                }
+            } else {
                 await dbRun(
-                    `UPDATE bookings SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [b.id]
+                    `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, 20, ?, 'محجوز', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                    [ownerObj.id, ownerPhone, resolvedName || null, cleanP, resolvedRenewalDay, `دعوة معلقة (${cleanP.slice(-4)})`]
                 );
-                archivedCount++;
-                console.log(`[FAMILY_SYNC] Archived stale member ${cleanB} (status=${b.status}) absent from owner ${ownerPhone} on Vodafone.`);
             }
         }
     }
@@ -2506,30 +2523,6 @@ app.post('/api/family/sync-live', async (req, res) => {
             resolvedRenewalDay
         );
 
-        // Also check passwords for this owner's members who have a password
-        const ownerMembers = await dbAll(
-            `SELECT id, phone, password FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND password IS NOT NULL AND TRIM(password) != '' AND deleted_at IS NULL`,
-            [owner.id, owner.phone]
-        );
-        for (const m of ownerMembers) {
-            try {
-                const mvf = await fastVodafoneCheck(m.phone, m.password.trim());
-                if (!mvf.valid) {
-                    await dbRun(
-                        `UPDATE bookings SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                        [mvf.message || 'الباسورد خطأ ❌', m.id]
-                    );
-                } else {
-                    let usageData = mvf.details ? JSON.stringify(mvf.details) : null;
-                    let memberName = mvf.details?.name || null;
-                    await dbRun(
-                        `UPDATE bookings SET password_valid = TRUE, password_error = NULL, name = COALESCE(?, name), last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                        [memberName, usageData, m.id]
-                    );
-                }
-            } catch (_) {}
-        }
-
         const rawOwner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [owner.id]);
         const updatedMembers = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
         const activeMembers = updatedMembers.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
@@ -2596,95 +2589,65 @@ app.post('/api/owners/sync-all', async (req, res) => {
         let membersFailed = 0;
         const invalidNumbers = [];
 
-        for (const owner of owners) {
-            try {
-                const vf = await fastVodafoneCheck(owner.phone, owner.password);
-                if (!vf.valid) {
+        // Concurrency pool of 3 simultaneous owner syncs for blazing-fast performance
+        const BATCH_SIZE = 3;
+        for (let i = 0; i < owners.length; i += BATCH_SIZE) {
+            const batch = owners.slice(i, i + BATCH_SIZE);
+            await Promise.all(batch.map(async (owner) => {
+                try {
+                    const vf = await fastVodafoneCheck(owner.phone, owner.password);
+                    if (!vf.valid) {
+                        ownersFailed++;
+                        const errMsg = vf.message || 'الباسورد خطأ ❌';
+                        await dbRun(
+                            `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                            [errMsg, owner.id]
+                        );
+                        invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: errMsg });
+                        return;
+                    }
+
+                    ownersSynced++;
+                    const vfData = vf.details || {};
+                    const resolvedName = vfData.name || owner.name;
+                    const resolvedPlan = vfData.currentPlan || owner.plan;
+                    const resolvedRenewalDay = vfData.renewal_day || owner.renewal_day;
+                    let resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
+                    resolvedTotalGB = Number(resolvedTotalGB) || 0;
+                    if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205)) {
+                        resolvedTotalGB = 204.8;
+                    }
+
+                    await dbRun(
+                        `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, unassigned_gigabytes = ?, unassigned_megabytes = ?, unassigned_display = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, vfData.unassigned_gigabytes ?? null, vfData.unassigned_megabytes ?? null, vfData.unassigned_display || null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
+                    );
+
+                    // Update owner_name on all bookings linked to this owner
+                    await dbRun(
+                        `UPDATE bookings SET owner_name = ?, updated_at = CURRENT_TIMESTAMP WHERE (owner_id = ? OR owner_phone = ?)`,
+                        [resolvedName, owner.id, owner.phone]
+                    );
+
+                    // Sync family members returned from Vodafone
+                    const syncRes = await syncOwnerFamilyMembersToDb(owner, vfData, resolvedName, resolvedRenewalDay);
+                    membersSynced += (syncRes?.syncedCount || 0);
+                } catch (oErr) {
                     ownersFailed++;
-                    const errMsg = vf.message || 'الباسورد خطأ ❌';
                     await dbRun(
                         `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                        [errMsg, owner.id]
+                        [oErr.message, owner.id]
                     );
-                    invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: errMsg });
-                    continue;
+                    invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: oErr.message });
                 }
-
-                ownersSynced++;
-                const vfData = vf.details || {};
-                const resolvedName = vfData.name || owner.name;
-                const resolvedPlan = vfData.currentPlan || owner.plan;
-                const resolvedRenewalDay = vfData.renewal_day || owner.renewal_day;
-                let resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
-                resolvedTotalGB = Number(resolvedTotalGB) || 0;
-                if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205)) {
-                    resolvedTotalGB = 204.8;
-                }
-
-                await dbRun(
-                    `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, unassigned_gigabytes = ?, unassigned_megabytes = ?, unassigned_display = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, vfData.unassigned_gigabytes ?? null, vfData.unassigned_megabytes ?? null, vfData.unassigned_display || null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
-                );
-
-                // Update owner_name on all bookings linked to this owner
-                await dbRun(
-                    `UPDATE bookings SET owner_name = ?, updated_at = CURRENT_TIMESTAMP WHERE (owner_id = ? OR owner_phone = ?)`,
-                    [resolvedName, owner.id, owner.phone]
-                );
-
-                // Sync family members returned from Vodafone (and archive removed ones)
-                await syncOwnerFamilyMembersToDb(owner, vfData, resolvedName, resolvedRenewalDay);
-
-                // Check passwords for members of this owner who have a password
-                const members = await dbAll(
-                    `SELECT id, phone, password FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND password IS NOT NULL AND TRIM(password) != '' AND deleted_at IS NULL`,
-                    [owner.id, owner.phone]
-                );
-
-                for (const member of members) {
-                    try {
-                        const mvf = await fastVodafoneCheck(member.phone, member.password.trim());
-                        if (!mvf.valid) {
-                            membersFailed++;
-                            const mErr = mvf.message || 'الباسورد خطأ ❌';
-                            await dbRun(
-                                `UPDATE bookings SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                                [mErr, member.id]
-                            );
-                            invalidNumbers.push({ phone: member.phone, role: 'فرد', error: mErr });
-                        } else {
-                            membersSynced++;
-                            let usageData = mvf.details ? JSON.stringify(mvf.details) : null;
-                            let memberName = mvf.details?.name || null;
-                            await dbRun(
-                                `UPDATE bookings SET password_valid = TRUE, password_error = NULL, name = COALESCE(?, name), last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                                [memberName, usageData, member.id]
-                            );
-                        }
-                    } catch (mErr) {
-                        membersFailed++;
-                        await dbRun(
-                            `UPDATE bookings SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                            [mErr.message, member.id]
-                        );
-                        invalidNumbers.push({ phone: member.phone, role: 'فرد', error: mErr.message });
-                    }
-                }
-            } catch (oErr) {
-                ownersFailed++;
-                await dbRun(
-                    `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [oErr.message, owner.id]
-                );
-                invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: oErr.message });
-            }
+            }));
         }
 
         const msgParts = [];
         if (ownersSynced > 0) msgParts.push(`تم تحديث ${ownersSynced} أونر بنجاح 👑`);
         if (membersSynced > 0) msgParts.push(`وتحديث ${membersSynced} فرد 📱`);
-        if (ownersFailed > 0 || membersFailed > 0) {
-            msgParts.push(`⚠️ تنبيه: تم اكتشاف ${ownersFailed + membersFailed} أرقام بها الباسورد غلط ❌`);
+        if (ownersFailed > 0) {
+            msgParts.push(`⚠️ تعذر مزامنة ${ownersFailed} أونر`);
         }
 
         res.json({
@@ -3752,22 +3715,23 @@ async function fastVodafoneCheck(msisdn, password) {
         clearTimeout(fTimeout);
         if (fRes.ok) {
             const fData = await fRes.json();
-            const group0 = Array.isArray(fData) ? fData[0] : fData;
-            const parts = group0?.parts || {};
-            const chars = parts.characteristicsValue?.characteristicsValue || [];
-            const totalMIChar = chars.find((c) => c.characteristicName === "totalMI");
-            if (totalMIChar && totalMIChar.value) {
-                familyTotalMI = Number(totalMIChar.value);
-            }
+            const groups = Array.isArray(fData) ? fData : (fData ? [fData] : []);
+            const seenPhones = new Set();
 
-            const rawMembers = parts.member;
-            if (Array.isArray(rawMembers)) {
-                familyInquiryOk = true;
-                for (const rm of rawMembers) {
-                    const idVal = rm.id?.[0]?.value || "";
-                    let memberPhone = idVal.replace(/[\s-]/g, "");
-                    if (memberPhone.startsWith("201")) memberPhone = memberPhone.substring(1);
-                    else if (memberPhone.startsWith("+201")) memberPhone = memberPhone.substring(3);
+            for (const group of groups) {
+                const parts = group?.parts || {};
+                const chars = parts.characteristicsValue?.characteristicsValue || group?.category || [];
+                const totalMIChar = Array.isArray(chars) ? chars.find((c) => c && c.characteristicName === "totalMI") : null;
+                if (totalMIChar && totalMIChar.value && !familyTotalMI) {
+                    familyTotalMI = Number(totalMIChar.value);
+                }
+
+                const rawMembers = parts.member;
+                if (Array.isArray(rawMembers)) {
+                    familyInquiryOk = true;
+                    for (const rm of rawMembers) {
+                        const memberPhone = extractMsisdnFromVodafoneMember(rm);
+                        if (!memberPhone) continue;
 
                     const isOwner = (rm.type?.toLowerCase() === "owner") || (memberPhone === clean);
                     if (isOwner) {
@@ -3780,20 +3744,20 @@ async function fastVodafoneCheck(msisdn, password) {
                         if (oSms && oSms.value) ownerSMS = Number(oSms.value);
                         continue;
                     }
-                    const rawStatus = String(rm.status ?? "");
-                    if (rawStatus === "5") {
+
+                    if (seenPhones.has(memberPhone)) continue;
+                    seenPhones.add(memberPhone);
+
+                    const rawStatus = String(rm.status ?? "").toLowerCase().trim();
+                    if (rawStatus === "5" || rawStatus === "pending" || rawStatus === "invited") {
                         pendingInvites.push({ phone: memberPhone, type: rm.type || "Member", status: "pending" });
                         continue;
                     }
-                    if (rawStatus !== "1") {
-                        inactiveMembers.push({ phone: memberPhone, type: rm.type || "Member", rawStatus });
-                        continue;
-                    }
 
-                    const mChars = rm.characteristic?.characteristicsValue || [];
-                    const miChar = mChars.find((c) => c.characteristicName === "MI");
-                    const voiceChar = mChars.find((c) => c.characteristicName === "Voice");
-                    const smsChar = mChars.find((c) => c.characteristicName === "SMS");
+                    const mChars = rm.characteristic?.characteristicsValue || rm.characteristicsValue?.characteristicsValue || [];
+                    const miChar = Array.isArray(mChars) ? mChars.find((c) => c && c.characteristicName === "MI") : null;
+                    const voiceChar = Array.isArray(mChars) ? mChars.find((c) => c && c.characteristicName === "Voice") : null;
+                    const smsChar = Array.isArray(mChars) ? mChars.find((c) => c && c.characteristicName === "SMS") : null;
 
                     const miMB = miChar ? Number(miChar.value) : 0;
                     if (miMB > 0) sumMemberMI += miMB;
@@ -3819,33 +3783,34 @@ async function fastVodafoneCheck(msisdn, password) {
                         sms: smsChar ? Number(smsChar.value) : 0,
                     });
                 }
-
-                if (ownerMI > 0) {
-                    unassignedMB = ownerMI;
-                } else if (familyTotalMI > 0) {
-                    unassignedMB = Math.max(0, familyTotalMI - sumMemberMI);
-                }
-
-                if (unassignedMB > 0) {
-                    if (unassignedMB < 1000) {
-                        unassignedGB = parseFloat((unassignedMB / 1000).toFixed(2));
-                        unassignedDisplay = `${unassignedMB} MB`;
-                    } else {
-                        const gb1000 = unassignedMB / 1000;
-                        const gb1024 = unassignedMB / 1024;
-                        if (unassignedMB % 1000 === 0) {
-                            unassignedGB = Math.round(gb1000);
-                        } else if (Math.abs(gb1000 - Math.round(gb1000)) < 0.1) {
-                            unassignedGB = parseFloat(gb1000.toFixed(1));
-                        } else {
-                            unassignedGB = parseFloat(gb1024.toFixed(1));
-                        }
-                        unassignedDisplay = `${unassignedGB} GB`;
-                    }
-                }
             }
         }
-    } catch (fErr) {
+
+        if (ownerMI > 0) {
+            unassignedMB = ownerMI;
+        } else if (familyTotalMI > 0) {
+            unassignedMB = Math.max(0, familyTotalMI - sumMemberMI);
+        }
+
+        if (unassignedMB > 0) {
+            if (unassignedMB < 1000) {
+                unassignedGB = parseFloat((unassignedMB / 1000).toFixed(2));
+                unassignedDisplay = `${unassignedMB} MB`;
+            } else {
+                const gb1000 = unassignedMB / 1000;
+                const gb1024 = unassignedMB / 1024;
+                if (unassignedMB % 1000 === 0) {
+                    unassignedGB = Math.round(gb1000);
+                } else if (Math.abs(gb1000 - Math.round(gb1000)) < 0.1) {
+                    unassignedGB = parseFloat(gb1000.toFixed(1));
+                } else {
+                    unassignedGB = parseFloat(gb1024.toFixed(1));
+                }
+                unassignedDisplay = `${unassignedGB} GB`;
+            }
+        }
+    }
+} catch (fErr) {
         console.error("Family group fetch warning:", fErr.message);
     }
 
