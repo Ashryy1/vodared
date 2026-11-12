@@ -184,6 +184,9 @@ async function initDB() {
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS actual_remaining_gigabytes REAL;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS used_gigabytes REAL;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS unassigned_gigabytes REAL;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS unassigned_megabytes INTEGER;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS unassigned_display TEXT;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_usage_data JSONB;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_usage_at TIMESTAMP;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewable_date TEXT;`,
@@ -450,13 +453,30 @@ app.get('/api/owners', async (req, res) => {
                  ORDER BY b.id DESC`,
                 [o.id, o.phone]
             );
-            const assignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
+            const activeMembers = members.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
+            const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : members).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
             const nextAssignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.next_gigabytes || m.gigabytes) || 0), 0).toFixed(1));
             let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
             if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205) || (!totalPkgGigs && o.plan?.includes('3000'))) {
                 totalPkgGigs = 204.8;
             }
-            const unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+
+            let unassignedGigs;
+            let unassignedDisplay;
+            if (o.unassigned_display) {
+                unassignedDisplay = o.unassigned_display;
+                unassignedGigs = Number(o.unassigned_gigabytes ?? 0);
+            } else if (o.unassigned_megabytes !== null && o.unassigned_megabytes !== undefined) {
+                const mb = Number(o.unassigned_megabytes);
+                unassignedDisplay = mb < 1000 ? `${mb} MB` : `${(mb / 1000).toFixed(1)} GB`;
+                unassignedGigs = Number((mb / 1000).toFixed(1));
+            } else {
+                unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+                unassignedDisplay = (unassignedGigs > 0 && unassignedGigs < 1)
+                    ? `${Math.round(unassignedGigs * 1000)} MB`
+                    : `${unassignedGigs} GB`;
+            }
+
             const nextUnassignedGigs = parseFloat(Math.max(0, totalPkgGigs - nextAssignedGigs).toFixed(1));
             const hasActualRem = (o.actual_remaining_gigabytes !== null && o.actual_remaining_gigabytes !== undefined);
             const actualRemGigs = hasActualRem ? Number(Number(o.actual_remaining_gigabytes).toFixed(1)) : null;
@@ -467,14 +487,15 @@ app.get('/api/owners', async (req, res) => {
             return {
                 ...o,
                 members,
-                members_count: members.length,
+                members_count: activeMembers.length > 0 ? activeMembers.length : members.length,
                 assigned_gigabytes: assignedGigs,
                 next_assigned_gigabytes: nextAssignedGigs,
                 package_gigabytes: totalPkgGigs,
                 total_gigabytes: totalPkgGigs,
                 unassigned_gigabytes: unassignedGigs,
+                unassigned_display: unassignedDisplay,
                 next_unassigned_gigabytes: nextUnassignedGigs,
-                remaining_gigabytes: actualRemGigs !== null ? actualRemGigs : unassignedGigs,
+                remaining_gigabytes: unassignedGigs,
                 actual_remaining_gigabytes: actualRemGigs,
                 used_gigabytes: actualUsedGigs,
                 next_remaining_gigabytes: nextUnassignedGigs
@@ -499,12 +520,29 @@ app.get('/api/owners/:id', async (req, res) => {
              ORDER BY b.id DESC`,
             [o.id, o.phone]
         );
-        const assignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
+        const activeMembers = members.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
+        const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : members).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
         let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
         if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205) || (!totalPkgGigs && o.plan?.includes('3000'))) {
             totalPkgGigs = 204.8;
         }
-        const unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+
+        let unassignedGigs;
+        let unassignedDisplay;
+        if (o.unassigned_display) {
+            unassignedDisplay = o.unassigned_display;
+            unassignedGigs = Number(o.unassigned_gigabytes ?? 0);
+        } else if (o.unassigned_megabytes !== null && o.unassigned_megabytes !== undefined) {
+            const mb = Number(o.unassigned_megabytes);
+            unassignedDisplay = mb < 1000 ? `${mb} MB` : `${(mb / 1000).toFixed(1)} GB`;
+            unassignedGigs = Number((mb / 1000).toFixed(1));
+        } else {
+            unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+            unassignedDisplay = (unassignedGigs > 0 && unassignedGigs < 1)
+                ? `${Math.round(unassignedGigs * 1000)} MB`
+                : `${unassignedGigs} GB`;
+        }
+
         const hasActualRem = (o.actual_remaining_gigabytes !== null && o.actual_remaining_gigabytes !== undefined);
         const actualRemGigs = hasActualRem ? Number(Number(o.actual_remaining_gigabytes).toFixed(1)) : null;
         const actualUsedGigs = (o.used_gigabytes !== null && o.used_gigabytes !== undefined)
@@ -516,12 +554,13 @@ app.get('/api/owners/:id', async (req, res) => {
             data: {
                 ...o,
                 members,
-                members_count: members.length,
+                members_count: activeMembers.length > 0 ? activeMembers.length : members.length,
                 assigned_gigabytes: assignedGigs,
                 package_gigabytes: totalPkgGigs,
                 total_gigabytes: totalPkgGigs,
                 unassigned_gigabytes: unassignedGigs,
-                remaining_gigabytes: actualRemGigs !== null ? actualRemGigs : unassignedGigs,
+                unassigned_display: unassignedDisplay,
+                remaining_gigabytes: unassignedGigs,
                 actual_remaining_gigabytes: actualRemGigs,
                 used_gigabytes: actualUsedGigs
             }
@@ -574,39 +613,45 @@ app.post('/api/owners', async (req, res) => {
         let ownerId;
         const actualRem = vfData.actual_remaining_gigabytes ?? null;
         const actualUsed = vfData.used_gigabytes ?? null;
+        const unassignedGB = vfData.unassigned_gigabytes ?? null;
+        const unassignedMB = vfData.unassigned_megabytes ?? null;
+        const unassignedDisp = vfData.unassigned_display || null;
         const usageJson = JSON.stringify(vfData);
         const renewDate = vfData.renewableDate || null;
 
         try {
             if (existing) {
                 await dbRun(
-                    `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, status = 'نشط', notes = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, usageJson, renewDate, notes || existing.notes || null, existing.id]
+                    `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, unassigned_gigabytes = ?, unassigned_megabytes = ?, unassigned_display = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, status = 'نشط', notes = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, unassignedGB, unassignedMB, unassignedDisp, usageJson, renewDate, notes || existing.notes || null, existing.id]
                 );
                 ownerId = existing.id;
             } else {
                 const result = await dbRun(
-                    `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, actual_remaining_gigabytes, used_gigabytes, last_usage_data, last_usage_at, renewable_date, status, notes, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 'نشط', ?, CURRENT_TIMESTAMP)`,
-                    [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, usageJson, renewDate, notes || null]
+                    `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, actual_remaining_gigabytes, used_gigabytes, unassigned_gigabytes, unassigned_megabytes, unassigned_display, last_usage_data, last_usage_at, renewable_date, status, notes, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 'نشط', ?, CURRENT_TIMESTAMP)`,
+                    [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, unassignedGB, unassignedMB, unassignedDisp, usageJson, renewDate, notes || null]
                 );
                 ownerId = result.lastID;
             }
         } catch (dbErr) {
             await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS actual_remaining_gigabytes REAL;').catch(() => {});
             await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS used_gigabytes REAL;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS unassigned_gigabytes REAL;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS unassigned_megabytes INTEGER;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS unassigned_display TEXT;').catch(() => {});
             await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_usage_data JSONB;').catch(() => {});
             await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_usage_at TIMESTAMP;').catch(() => {});
             await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewable_date TEXT;').catch(() => {});
             if (existing) {
                 await dbRun(
-                    `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, status = 'نشط', notes = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, usageJson, renewDate, notes || existing.notes || null, existing.id]
+                    `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, unassigned_gigabytes = ?, unassigned_megabytes = ?, unassigned_display = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, status = 'نشط', notes = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, unassignedGB, unassignedMB, unassignedDisp, usageJson, renewDate, notes || existing.notes || null, existing.id]
                 );
                 ownerId = existing.id;
             } else {
                 const result = await dbRun(
-                    `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, actual_remaining_gigabytes, used_gigabytes, last_usage_data, last_usage_at, renewable_date, status, notes, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 'نشط', ?, CURRENT_TIMESTAMP)`,
-                    [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, usageJson, renewDate, notes || null]
+                    `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, actual_remaining_gigabytes, used_gigabytes, unassigned_gigabytes, unassigned_megabytes, unassigned_display, last_usage_data, last_usage_at, renewable_date, status, notes, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 'نشط', ?, CURRENT_TIMESTAMP)`,
+                    [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, unassignedGB, unassignedMB, unassignedDisp, usageJson, renewDate, notes || null]
                 );
                 ownerId = result.lastID;
             }
@@ -2429,8 +2474,8 @@ app.post('/api/family/sync-live', async (req, res) => {
         }
 
         await dbRun(
-            `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-            [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
+            `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, unassigned_gigabytes = ?, unassigned_megabytes = ?, unassigned_display = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, vfData.unassigned_gigabytes ?? null, vfData.unassigned_megabytes ?? null, vfData.unassigned_display || null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
         );
 
         // Update owner_name on all bookings belonging to this owner
@@ -2472,18 +2517,36 @@ app.post('/api/family/sync-live', async (req, res) => {
 
         const rawOwner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [owner.id]);
         const updatedMembers = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
-        const assignedGigs = parseFloat(updatedMembers.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
+        const activeMembers = updatedMembers.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
+        const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : updatedMembers).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
         const totalPkgGigs = parseFloat((Number(rawOwner.total_gigabytes) || 204.8).toFixed(1));
-        const unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+
+        let unassignedGigs;
+        let unassignedDisplay;
+        if (rawOwner.unassigned_display) {
+            unassignedDisplay = rawOwner.unassigned_display;
+            unassignedGigs = Number(rawOwner.unassigned_gigabytes ?? 0);
+        } else if (rawOwner.unassigned_megabytes !== null && rawOwner.unassigned_megabytes !== undefined) {
+            const mb = Number(rawOwner.unassigned_megabytes);
+            unassignedDisplay = mb < 1000 ? `${mb} MB` : `${(mb / 1000).toFixed(1)} GB`;
+            unassignedGigs = Number((mb / 1000).toFixed(1));
+        } else {
+            unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+            unassignedDisplay = (unassignedGigs > 0 && unassignedGigs < 1)
+                ? `${Math.round(unassignedGigs * 1000)} MB`
+                : `${unassignedGigs} GB`;
+        }
+
         const enrichedOwner = {
             ...rawOwner,
             members: updatedMembers,
-            members_count: updatedMembers.length,
+            members_count: activeMembers.length > 0 ? activeMembers.length : updatedMembers.length,
             assigned_gigabytes: assignedGigs,
             unassigned_gigabytes: unassignedGigs,
+            unassigned_display: unassignedDisplay,
             package_gigabytes: totalPkgGigs,
             total_gigabytes: totalPkgGigs,
-            remaining_gigabytes: rawOwner.actual_remaining_gigabytes !== null && rawOwner.actual_remaining_gigabytes !== undefined ? Number(rawOwner.actual_remaining_gigabytes) : unassignedGigs,
+            remaining_gigabytes: unassignedGigs,
             actual_remaining_gigabytes: rawOwner.actual_remaining_gigabytes !== null && rawOwner.actual_remaining_gigabytes !== undefined ? Number(rawOwner.actual_remaining_gigabytes) : null,
             used_gigabytes: rawOwner.used_gigabytes !== null && rawOwner.used_gigabytes !== undefined ? Number(rawOwner.used_gigabytes) : null
         };
@@ -2541,8 +2604,8 @@ app.post('/api/owners/sync-all', async (req, res) => {
                 }
 
                 await dbRun(
-                    `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
+                    `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, unassigned_gigabytes = ?, unassigned_megabytes = ?, unassigned_display = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, vfData.unassigned_gigabytes ?? null, vfData.unassigned_megabytes ?? null, vfData.unassigned_display || null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
                 );
 
                 // Update owner_name on all bookings linked to this owner
@@ -3643,6 +3706,14 @@ async function fastVodafoneCheck(msisdn, password) {
     let inactiveMembers = [];
     let familyInquiryOk = false;
     let familyTotalMI = 0;
+    let ownerMI = 0;
+    let ownerVoice = 0;
+    let ownerSMS = 0;
+    let sumMemberMI = 0;
+    let unassignedMB = 0;
+    let unassignedGB = 0;
+    let unassignedDisplay = "0 MB";
+
     try {
         const familyUrl = "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup?type=Family";
         const fController = new AbortController();
@@ -3681,7 +3752,16 @@ async function fastVodafoneCheck(msisdn, password) {
                     else if (memberPhone.startsWith("+201")) memberPhone = memberPhone.substring(3);
 
                     const isOwner = (rm.type?.toLowerCase() === "owner") || (memberPhone === clean);
-                    if (isOwner) continue;
+                    if (isOwner) {
+                        const oChars = rm.characteristic?.characteristicsValue || [];
+                        const oMi = oChars.find((c) => c.characteristicName === "MI");
+                        const oVoice = oChars.find((c) => c.characteristicName === "Voice");
+                        const oSms = oChars.find((c) => c.characteristicName === "SMS");
+                        if (oMi && oMi.value) ownerMI = Number(oMi.value);
+                        if (oVoice && oVoice.value) ownerVoice = Number(oVoice.value);
+                        if (oSms && oSms.value) ownerSMS = Number(oSms.value);
+                        continue;
+                    }
                     const rawStatus = String(rm.status ?? "");
                     if (rawStatus === "5") {
                         pendingInvites.push({ phone: memberPhone, type: rm.type || "Member", status: "pending" });
@@ -3698,6 +3778,7 @@ async function fastVodafoneCheck(msisdn, password) {
                     const smsChar = mChars.find((c) => c.characteristicName === "SMS");
 
                     const miMB = miChar ? Number(miChar.value) : 0;
+                    if (miMB > 0) sumMemberMI += miMB;
                     let miGB = 0;
                     if (miMB > 0) {
                         if (miMB % 1000 === 0) {
@@ -3719,6 +3800,30 @@ async function fastVodafoneCheck(msisdn, password) {
                         voice: voiceChar ? Number(voiceChar.value) : 0,
                         sms: smsChar ? Number(smsChar.value) : 0,
                     });
+                }
+
+                if (ownerMI > 0) {
+                    unassignedMB = ownerMI;
+                } else if (familyTotalMI > 0) {
+                    unassignedMB = Math.max(0, familyTotalMI - sumMemberMI);
+                }
+
+                if (unassignedMB > 0) {
+                    if (unassignedMB < 1000) {
+                        unassignedGB = parseFloat((unassignedMB / 1000).toFixed(2));
+                        unassignedDisplay = `${unassignedMB} MB`;
+                    } else {
+                        const gb1000 = unassignedMB / 1000;
+                        const gb1024 = unassignedMB / 1024;
+                        if (unassignedMB % 1000 === 0) {
+                            unassignedGB = Math.round(gb1000);
+                        } else if (Math.abs(gb1000 - Math.round(gb1000)) < 0.1) {
+                            unassignedGB = parseFloat(gb1000.toFixed(1));
+                        } else {
+                            unassignedGB = parseFloat(gb1024.toFixed(1));
+                        }
+                        unassignedDisplay = `${unassignedGB} GB`;
+                    }
                 }
             }
         }
@@ -3809,6 +3914,12 @@ async function fastVodafoneCheck(msisdn, password) {
         total_gigabytes: totalGB,
         actual_remaining_gigabytes: actualRemainingGB,
         used_gigabytes: usedGB,
+        unassigned_megabytes: unassignedMB,
+        unassigned_gigabytes: unassignedGB,
+        unassigned_display: unassignedDisplay,
+        owner_mi: ownerMI,
+        owner_voice: ownerVoice,
+        owner_sms: ownerSMS,
         accessToken,
         familyInquiryOk,
         familyMembers,
