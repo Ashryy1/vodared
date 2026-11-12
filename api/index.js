@@ -4234,118 +4234,65 @@ app.post('/api/usage', async (req, res) => {
             password = password || bookingRow.password;
         }
 
-        // A) If member has password, check member directly
-        let memberDirectCheckFailed = false;
-        if (cleanPhone && password && password.trim()) {
-            const result = await fastVodafoneCheck(cleanPhone, password.trim());
-            if (result.valid && result.details) {
-                if (bookingRow) {
-                    try {
-                        const memberName = result.details.name || null;
-                        await dbRun(
-                            `UPDATE bookings SET name = COALESCE(?, name), last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, password_valid = TRUE, password_error = NULL WHERE id = ?`,
-                            [memberName, JSON.stringify(result.details), bookingRow.id]
-                        );
-                    } catch (_) {}
-                }
-                return res.json({
-                    success: true,
-                    fetchedViaOwner: false,
-                    message: result.message,
-                    data: {
-                        ...result.details,
-                        fetchedViaOwner: false,
-                        booking: bookingRow ? {
-                            id: bookingRow.id,
-                            phone: bookingRow.phone,
-                            gigabytes: bookingRow.gigabytes,
-                            renewal_day: bookingRow.renewal_day,
-                            status: bookingRow.status
-                        } : null
-                    }
-                });
-            } else if (result.isBadPassword) {
-                memberDirectCheckFailed = true;
-                if (bookingRow) {
-                    try {
-                        await dbRun(
-                            `UPDATE bookings SET password_valid = FALSE, password_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                            [result.message || 'الباسورد خطأ ❌', bookingRow.id]
-                        );
-                    } catch (_) {}
-                }
-            }
+        if (!cleanPhone) {
+            return res.status(400).json({ success: false, error: 'رقم الموبايل مطلوب' });
         }
 
-        // B) If member does NOT have password, or member password is invalid: try via owner!
-        if (bookingRow && (bookingRow.owner_id || bookingRow.owner_phone)) {
-            const owner = await dbGet(`SELECT * FROM owners WHERE id = ? OR phone = ?`, [bookingRow.owner_id, bookingRow.owner_phone]);
-            if (owner && owner.password) {
-                const ownerVf = await fastVodafoneCheck(owner.phone, owner.password);
-                if (ownerVf.valid && ownerVf.details?.accessToken) {
-                    const memberUsage = await fetchVodafoneUsageForMsisdn(cleanPhone, ownerVf.details.accessToken, owner.phone);
-                    if (memberUsage) {
-                        await dbRun(
-                            `UPDATE bookings SET last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                            [JSON.stringify(memberUsage), bookingRow.id]
-                        );
-                        return res.json({
-                            success: true,
-                            fetchedViaOwner: true,
-                            message: memberDirectCheckFailed 
-                                ? 'تم جلب استهلاك الفرد بنجاح عبر حساب الأونر (لأن باسورد الفرد الشخصي غير صحيح لدى فودافون)'
-                                : 'تم جلب استهلاك الفرد بنجاح عبر حساب الأونر ✅',
-                            data: {
-                                ...memberUsage,
-                                fetchedViaOwner: true,
-                                name: bookingRow.name,
-                                currentPlan: 'باقة فودافون ريد (عضو)',
-                                booking: {
-                                    id: bookingRow.id,
-                                    phone: bookingRow.phone,
-                                    gigabytes: bookingRow.gigabytes,
-                                    renewal_day: bookingRow.renewal_day,
-                                    status: bookingRow.status
-                                }
-                            }
-                        });
-                    }
-                }
-            }
+        // Member usage strictly relies on the member's own Ana Vodafone password
+        if (!password || !password.trim()) {
+            return res.status(400).json({
+                success: false,
+                requiresPassword: true,
+                error: 'يرجى تسجيل باسورد أنا فودافون الخاص بالفرد أولاً لسحب استهلاكه الفعلي مباشرة من فودافون 🔑'
+            });
         }
 
-        // C) Fallback to cached usage if available
-        if (bookingRow && bookingRow.last_usage_data) {
-            const parsed = typeof bookingRow.last_usage_data === 'string' ? JSON.parse(bookingRow.last_usage_data) : bookingRow.last_usage_data;
+        const result = await fastVodafoneCheck(cleanPhone, password.trim());
+        if (result.valid && result.details) {
+            if (bookingRow) {
+                try {
+                    const memberName = result.details.name || null;
+                    await dbRun(
+                        `UPDATE bookings SET name = COALESCE(?, name), last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, password_valid = TRUE, password_error = NULL WHERE id = ?`,
+                        [memberName, JSON.stringify(result.details), bookingRow.id]
+                    );
+                } catch (_) {}
+            }
             return res.json({
                 success: true,
-                cached: true,
-                message: `تم عرض آخر استهلاك تم سحبه للفرد (${bookingRow.last_usage_at ? String(bookingRow.last_usage_at).split(' ')[0] : 'سابقاً'})`,
+                message: result.message || 'تم سحب الاستهلاك الفعلي للفرد بنجاح عبر حسابه في فودافون ✅',
                 data: {
-                    ...parsed,
-                    name: bookingRow.name,
-                    booking: {
+                    ...result.details,
+                    booking: bookingRow ? {
                         id: bookingRow.id,
                         phone: bookingRow.phone,
                         gigabytes: bookingRow.gigabytes,
                         renewal_day: bookingRow.renewal_day,
                         status: bookingRow.status
-                    }
+                    } : null
                 }
             });
         }
 
-        if (!password) {
+        if (result.isBadPassword) {
+            if (bookingRow) {
+                try {
+                    await dbRun(
+                        `UPDATE bookings SET password_valid = FALSE, password_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        ['الباسورد خطأ ❌', bookingRow.id]
+                    );
+                } catch (_) {}
+            }
             return res.status(400).json({
                 success: false,
-                need_password: true,
-                error: 'باسورد الفرد غير مسجل ولا يمكن سحب استهلاكه حالياً بدون باسورد أنا فودافون.'
+                isBadPassword: true,
+                error: 'كلمة مرور أنا فودافون الخاصة بالفرد غير صحيحة ❌ يرجى تعديل الباسورد والتأكد منه في تطبيق أنا فودافون'
             });
         }
 
-        return res.status(400).json({
+        return res.status(500).json({
             success: false,
-            error: 'تعذر جلب الاستهلاك من فودافون (تأكد من صحة الباسورد)'
+            error: result.message || 'تعذر الاتصال بسيرفرات فودافون لجلب استهلاك الفرد حالياً'
         });
     } catch (e) {
         return res.status(500).json({ success: false, error: 'حدث خطأ أثناء جلب الاستهلاك: ' + e.message });
