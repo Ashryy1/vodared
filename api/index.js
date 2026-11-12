@@ -2248,7 +2248,7 @@ app.put('/api/members/:id/password', async (req, res) => {
         let usageData = vf.details ? JSON.stringify(vf.details) : null;
         let memberName = vf.details?.name || null;
         await dbRun(
-            `UPDATE bookings SET password = ?, name = COALESCE(?, name), last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            `UPDATE bookings SET password = ?, name = COALESCE(?, name), last_usage_data = COALESCE(?, last_usage_data), last_usage_at = CURRENT_TIMESTAMP, password_valid = TRUE, password_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
             [cleanPass, memberName, usageData, id]
         );
 
@@ -4207,6 +4207,7 @@ app.post('/api/usage', async (req, res) => {
         }
 
         // A) If member has password, check member directly
+        let memberDirectCheckFailed = false;
         if (cleanPhone && password && password.trim()) {
             const result = await fastVodafoneCheck(cleanPhone, password.trim());
             if (result.valid && result.details) {
@@ -4214,16 +4215,18 @@ app.post('/api/usage', async (req, res) => {
                     try {
                         const memberName = result.details.name || null;
                         await dbRun(
-                            `UPDATE bookings SET name = COALESCE(?, name), last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                            `UPDATE bookings SET name = COALESCE(?, name), last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, password_valid = TRUE, password_error = NULL WHERE id = ?`,
                             [memberName, JSON.stringify(result.details), bookingRow.id]
                         );
                     } catch (_) {}
                 }
                 return res.json({
                     success: true,
+                    fetchedViaOwner: false,
                     message: result.message,
                     data: {
                         ...result.details,
+                        fetchedViaOwner: false,
                         booking: bookingRow ? {
                             id: bookingRow.id,
                             phone: bookingRow.phone,
@@ -4233,10 +4236,20 @@ app.post('/api/usage', async (req, res) => {
                         } : null
                     }
                 });
+            } else if (result.isBadPassword) {
+                memberDirectCheckFailed = true;
+                if (bookingRow) {
+                    try {
+                        await dbRun(
+                            `UPDATE bookings SET password_valid = FALSE, password_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                            [result.message || 'الباسورد خطأ ❌', bookingRow.id]
+                        );
+                    } catch (_) {}
+                }
             }
         }
 
-        // B) If member does NOT have password, try via owner!
+        // B) If member does NOT have password, or member password is invalid: try via owner!
         if (bookingRow && (bookingRow.owner_id || bookingRow.owner_phone)) {
             const owner = await dbGet(`SELECT * FROM owners WHERE id = ? OR phone = ?`, [bookingRow.owner_id, bookingRow.owner_phone]);
             if (owner && owner.password) {
@@ -4250,9 +4263,13 @@ app.post('/api/usage', async (req, res) => {
                         );
                         return res.json({
                             success: true,
-                            message: 'تم جلب استهلاك الفرد بنجاح عبر حساب الأونر ✅',
+                            fetchedViaOwner: true,
+                            message: memberDirectCheckFailed 
+                                ? 'تم جلب استهلاك الفرد بنجاح عبر حساب الأونر (لأن باسورد الفرد الشخصي غير صحيح لدى فودافون)'
+                                : 'تم جلب استهلاك الفرد بنجاح عبر حساب الأونر ✅',
                             data: {
                                 ...memberUsage,
+                                fetchedViaOwner: true,
                                 name: bookingRow.name,
                                 currentPlan: 'باقة فودافون ريد (عضو)',
                                 booking: {
