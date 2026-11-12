@@ -880,8 +880,26 @@ async function authenticateVodafoneOwner(phone, password) {
     const postText = await postResp.text();
     const locationHeader = postResp.headers.get('location') || '';
 
-    if (postText.includes('invalid') || postText.includes('error') || postText.includes('كلمة المرور غير صحيحة')) {
-        return { success: false, message: 'رقم الموبايل أو كلمة السر غير صحيحة على شبكة فودافون' };
+    // Check for WAF or server errors first
+    if (postResp.status === 555 || postText.includes('The requested URL was rejected') || postText.includes('Request Rejected')) {
+        return { success: false, isNetworkError: true, message: 'رفضت بوابة الحماية (WAF) في فودافون الطلب مؤقتاً، يرجى المحاولة بعد قليل' };
+    }
+    if (postResp.status === 429 || postText.includes('Too Many Requests')) {
+        return { success: false, isNetworkError: true, message: 'تم تجاوز معدل المحاولات المسموح به مؤقتاً في فودافون (429)، يرجى الانتظار دقيقة' };
+    }
+    if (postResp.status >= 500) {
+        return { success: false, isNetworkError: true, message: `خوادم تسجيل دخول فودافون لا تستجيب حالياً (كود ${postResp.status})` };
+    }
+
+    const isBadCredentials = postText.includes('اسم المستخدم أو كلمة المرور غير صحيحة') ||
+        postText.includes('كلمة السر غير صحيحة') ||
+        postText.includes('كلمة المرور غير صحيحة') ||
+        postText.includes('Invalid username or password') ||
+        postText.includes('invalid_grant') ||
+        (postText.includes('kc-feedback-text') && (postText.includes('invalid') || postText.includes('غير صحيحة') || postText.includes('خطأ')));
+
+    if (isBadCredentials) {
+        return { success: false, isBadPassword: true, message: 'رقم الموبايل أو كلمة السر غير صحيحة على شبكة فودافون ❌' };
     }
 
     if (postText.includes('otp') || postText.includes('verification') || postText.includes('كود التحقق')) {
@@ -889,7 +907,7 @@ async function authenticateVodafoneOwner(phone, password) {
     }
 
     if (!locationHeader) {
-        return { success: false, message: 'فشل التحقق من الحساب: لم يتم تحويل الجلسة' };
+        return { success: false, isNetworkError: true, message: 'تعذر إتمام الدخول إلى فودافون مؤقتاً (لم يتم تحويل الجلسة)' };
     }
 
     const codeMatch = locationHeader.match(/[?&]code=([^&]+)/);
@@ -1187,39 +1205,48 @@ async function sendVodafoneFamilyInvitation(owner, memberPhone, quotaGB, minutes
     const formattedMember = `20${cleanMemberPhone.replace(/^0/, '')}`;
     const formattedOwner = `20${cleanOwnerPhone.replace(/^0/, '')}`;
 
+    let context = { roleName: "EnterpriseRedFamily", categories: [], members: [] };
     try {
-        const cgUrl = "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup?type=Family&$.parts.member.type=owner";
-        const cgRes = await callVodafoneForOwner(owner, cgUrl);
-        const fg = Array.isArray(cgRes.data) ? cgRes.data[0] : cgRes.data;
-        const currentMembers = fg?.parts?.member || [];
-        const existingMember = currentMembers.find(m => {
-            const val = displayMsisdn(m.id?.[0]?.value || '');
-            return val === cleanMemberPhone;
-        });
-        if (existingMember && existingMember.status === '1') {
+        context = await resolveVodafoneFamilyContext(owner, cleanMemberPhone);
+        if (context.matchedMember && (String(context.matchedMember.status) === '1' || String(context.matchedMember.status) === '5')) {
             return {
                 success: false,
                 error: `الرقم ${cleanMemberPhone} مضاف بالفعل كعضو نشط في باقة عائلة فودافون!`
             };
         }
-    } catch (_) {}
+
+        const activeMembersCount = (context.members || []).filter(m => {
+            const type = String(m?.type || '').toLowerCase();
+            const st = String(m?.status ?? '');
+            return type !== 'owner' && (st === '1' || st === '5');
+        }).length;
+
+        if (activeMembersCount >= 6) {
+            return {
+                success: false,
+                error: `وصل هذا الأونر للحد الأقصى المسموح به في فودافون (6 أفراد نشطين بالفعل في باقة العائلة). لا يمكن إضافة المزيد!`
+            };
+        }
+    } catch (e) {
+        console.warn(`[ADD_MEMBER] Family context check error for ${cleanMemberPhone}:`, e.message);
+    }
 
     const miMB = (Number(quotaGB) || 20) * 1024;
     const voiceMinutes = Number(minutes) || 1500;
 
-    let roleName = "EnterpriseRedFamily";
-    if (owner.plan && owner.plan.toLowerCase().includes("flex")) {
-        roleName = "FlexFamily";
-    }
+    const roleName = context.roleName || (owner.plan && owner.plan.toLowerCase().includes("flex") ? "FlexFamily" : "EnterpriseRedFamily");
+    const categories = (Array.isArray(context.categories) && context.categories.length > 0)
+        ? context.categories
+        : [
+            { value: "8805", listHierarchyId: "TierID" },
+            { value: "8805", listHierarchyId: "PackageID" },
+            { value: "880", listHierarchyId: "TemplateID" }
+        ];
 
     const payload = {
         name: roleName,
         type: "SendInvitation",
-        category: [
-            { value: "8805", listHierarchyId: "TierID" },
-            { value: "8805", listHierarchyId: "PackageID" },
-            { value: "880", listHierarchyId: "TemplateID" }
-        ],
+        category: categories,
         parts: {
             member: [
                 { id: [{ value: formattedOwner, schemeName: "MSISDN" }], type: "Owner" },
@@ -1237,7 +1264,7 @@ async function sendVodafoneFamilyInvitation(owner, memberPhone, quotaGB, minutes
     console.log(`[ADD_MEMBER] Dispatching Vodafone DXL invitation to ${cleanMemberPhone}...`);
     const resp = await callVodafoneForOwner(
         owner,
-        "https://web.vodafone.com.eg/services/dxl/cg/customerGroupAPI/customerGroup",
+        VODAFONE_CUSTOMER_GROUP_URL,
         "POST",
         payload
     );
@@ -2030,6 +2057,21 @@ async function handleAddMember(req, res) {
         let autoAccepted = false;
         let verifiedName = name;
 
+        // Check if owner already reached 6-member Vodafone limit
+        if (owner) {
+            const memberCountRow = await dbGet(
+                `SELECT COUNT(*) as count FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL`,
+                [owner.id, owner.phone]
+            );
+            const currentMemberCount = Number(memberCountRow?.count) || 0;
+            if (currentMemberCount >= 6) {
+                return res.status(400).json({
+                    success: false,
+                    error: `وصل هذا الأونر للحد الأقصى المسموح به في باقات فودافون (6 أفراد كحد أقصى)! لا يمكن إضافة المزيد.`
+                });
+            }
+        }
+
         // If owner exists and has password, communicate with Vodafone network!
         if (owner && owner.password) {
             let memberAuthRes = null;
@@ -2487,11 +2529,13 @@ app.post('/api/family/sync-live', async (req, res) => {
 
         const vf = await fastVodafoneCheck(owner.phone, owner.password);
         if (!vf.valid) {
-            const errMsg = vf.message || 'الباسورد غير صحيح لدى فودافون ❌';
-            await dbRun(
-                `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                [errMsg, owner.id]
-            );
+            const errMsg = vf.message || 'تعذر الاتصال بشبكة فودافون مؤقتاً';
+            if (vf.isBadPassword) {
+                await dbRun(
+                    `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [errMsg, owner.id]
+                );
+            }
             return res.status(400).json({ success: false, error: errMsg });
         }
 
@@ -2598,12 +2642,19 @@ app.post('/api/owners/sync-all', async (req, res) => {
                     const vf = await fastVodafoneCheck(owner.phone, owner.password);
                     if (!vf.valid) {
                         ownersFailed++;
-                        const errMsg = vf.message || 'الباسورد خطأ ❌';
-                        await dbRun(
-                            `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                            [errMsg, owner.id]
-                        );
-                        invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: errMsg });
+                        const errMsg = vf.message || 'تعذر الاتصال بشبكة فودافون مؤقتاً';
+                        if (vf.isBadPassword) {
+                            await dbRun(
+                                `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                                [errMsg, owner.id]
+                            );
+                            invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: errMsg });
+                        } else {
+                            await dbRun(
+                                `UPDATE owners SET last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                                [owner.id]
+                            );
+                        }
                         return;
                     }
 
@@ -2635,10 +2686,10 @@ app.post('/api/owners/sync-all', async (req, res) => {
                 } catch (oErr) {
                     ownersFailed++;
                     await dbRun(
-                        `UPDATE owners SET password_valid = FALSE, password_error = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                        [oErr.message, owner.id]
+                        `UPDATE owners SET last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [owner.id]
                     );
-                    invalidNumbers.push({ phone: owner.phone, role: 'أونر', error: oErr.message });
+                    console.warn(`[SYNC_ALL] Owner ${owner.phone} sync error:`, oErr.message);
                 }
             }));
         }
@@ -3594,34 +3645,60 @@ async function fastVodafoneCheck(msisdn, password) {
     const getCookieStr = () => Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
 
     // 1. Initial Page
-    const pageRes = await fetch(authUrl.toString(), { redirect: "manual", headers: { "User-Agent": ua, Accept: "text/html" } });
+    let pageRes;
+    try {
+        pageRes = await fetch(authUrl.toString(), { redirect: "manual", headers: { "User-Agent": ua, Accept: "text/html" } });
+    } catch (netErr) {
+        return { valid: false, isNetworkError: true, message: 'تعذر الاتصال ببوابة فودافون: ' + netErr.message };
+    }
     addCookies(pageRes);
 
     const html = await pageRes.text();
     const formAction = extractFormAction(html);
-    if (!formAction) return { valid: false, message: 'مؤقتًا، النظام لا يستجيب', error: 'No form action' };
+    if (!formAction) return { valid: false, isNetworkError: true, message: 'مؤقتًا، بوابة فودافون لا تستجيب', error: 'No form action' };
 
     // 2. Submit Login
-    const loginRes = await fetch(formAction, {
-        method: "POST", redirect: "manual",
-        headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            Cookie: getCookieStr(),
-            "User-Agent": ua,
-            Referer: authUrl.toString(),
-            Origin: "https://web.vodafone.com.eg"
-        },
-        body: new URLSearchParams({ username: clean, password }).toString(),
-    });
+    let loginRes;
+    try {
+        loginRes = await fetch(formAction, {
+            method: "POST", redirect: "manual",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                Cookie: getCookieStr(),
+                "User-Agent": ua,
+                Referer: authUrl.toString(),
+                Origin: "https://web.vodafone.com.eg"
+            },
+            body: new URLSearchParams({ username: clean, password }).toString(),
+        });
+    } catch (netErr) {
+        return { valid: false, isNetworkError: true, message: 'تعذر إرسال بيانات الدخول لفودافون: ' + netErr.message };
+    }
     addCookies(loginRes);
     const redir = loginRes.headers.get("location");
 
     if (!redir) {
         const b = await loginRes.text();
-        if (b.includes("Invalid") || b.includes("invalid") || b.includes("خطأ") || b.includes('برجاء ادخال')) {
-            return { valid: false, message: 'الباسورد خطأ ❌' };
+        if (loginRes.status === 555 || b.includes("The requested URL was rejected") || b.includes("Request Rejected")) {
+            return { valid: false, isNetworkError: true, message: 'رفضت بوابة الحماية (WAF) في فودافون الطلب مؤقتاً، يرجى المحاولة بعد قليل' };
         }
-        return { valid: false, message: 'فشل تسجيل الدخول ❌', error: 'Unknown HTML' };
+        if (loginRes.status === 429 || b.includes("Too Many Requests")) {
+            return { valid: false, isNetworkError: true, message: 'تم تجاوز معدل المحاولات مؤقتاً في فودافون (429)' };
+        }
+        if (loginRes.status >= 500) {
+            return { valid: false, isNetworkError: true, message: `خوادم فودافون غير متاحة مؤقتاً (كود ${loginRes.status})` };
+        }
+        const isBadCredentials = b.includes("اسم المستخدم أو كلمة المرور غير صحيحة") ||
+            b.includes("كلمة السر غير صحيحة") ||
+            b.includes("كلمة المرور غير صحيحة") ||
+            b.includes("Invalid username or password") ||
+            b.includes("invalid_grant") ||
+            (b.includes("kc-feedback-text") && (b.includes("invalid") || b.includes("غير صحيحة") || b.includes("خطأ")));
+
+        if (isBadCredentials) {
+            return { valid: false, isBadPassword: true, message: 'الباسورد خطأ ❌' };
+        }
+        return { valid: false, isNetworkError: true, message: 'تعذر التحقق من فودافون مؤقتاً، يرجى المحاولة لاحقاً', error: 'Unknown HTML' };
     }
 
     const code = extractCodeFromUrl(redir);
