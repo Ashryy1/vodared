@@ -182,6 +182,11 @@ async function initDB() {
     const columnQueries = [
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS invitation_accepted_at TIMESTAMP;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS actual_remaining_gigabytes REAL;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS used_gigabytes REAL;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_usage_data JSONB;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_usage_at TIMESTAMP;`,
+        `ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewable_date TEXT;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS plan TEXT;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;`,
         `ALTER TABLE owners ADD COLUMN IF NOT EXISTS notes TEXT;`,
@@ -203,6 +208,9 @@ async function initDB() {
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS next_gigabytes INTEGER;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS next_quota_notes TEXT;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS gigabytes INTEGER DEFAULT 0;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS megabytes INTEGER;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS voice_minutes INTEGER;`,
+        `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS sms_count INTEGER;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS renewal_day INTEGER DEFAULT 7;`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'محجوز';`,
         `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;`,
@@ -448,8 +456,14 @@ app.get('/api/owners', async (req, res) => {
             if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205) || (!totalPkgGigs && o.plan?.includes('3000'))) {
                 totalPkgGigs = 204.8;
             }
-            const remainingGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
-            const nextRemainingGigs = parseFloat(Math.max(0, totalPkgGigs - nextAssignedGigs).toFixed(1));
+            const unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+            const nextUnassignedGigs = parseFloat(Math.max(0, totalPkgGigs - nextAssignedGigs).toFixed(1));
+            const hasActualRem = (o.actual_remaining_gigabytes !== null && o.actual_remaining_gigabytes !== undefined);
+            const actualRemGigs = hasActualRem ? Number(Number(o.actual_remaining_gigabytes).toFixed(1)) : null;
+            const actualUsedGigs = (o.used_gigabytes !== null && o.used_gigabytes !== undefined)
+                ? Number(Number(o.used_gigabytes).toFixed(1))
+                : (hasActualRem ? parseFloat(Math.max(0, totalPkgGigs - (actualRemGigs || 0)).toFixed(1)) : null);
+
             return {
                 ...o,
                 members,
@@ -458,8 +472,12 @@ app.get('/api/owners', async (req, res) => {
                 next_assigned_gigabytes: nextAssignedGigs,
                 package_gigabytes: totalPkgGigs,
                 total_gigabytes: totalPkgGigs,
-                remaining_gigabytes: remainingGigs,
-                next_remaining_gigabytes: nextRemainingGigs
+                unassigned_gigabytes: unassignedGigs,
+                next_unassigned_gigabytes: nextUnassignedGigs,
+                remaining_gigabytes: actualRemGigs !== null ? actualRemGigs : unassignedGigs,
+                actual_remaining_gigabytes: actualRemGigs,
+                used_gigabytes: actualUsedGigs,
+                next_remaining_gigabytes: nextUnassignedGigs
             };
         }));
         res.json({ success: true, data: ownersWithMembers });
@@ -481,11 +499,18 @@ app.get('/api/owners/:id', async (req, res) => {
              ORDER BY b.id DESC`,
             [o.id, o.phone]
         );
-        const assignedGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
+        const assignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
         let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
         if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205) || (!totalPkgGigs && o.plan?.includes('3000'))) {
             totalPkgGigs = 204.8;
         }
+        const unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+        const hasActualRem = (o.actual_remaining_gigabytes !== null && o.actual_remaining_gigabytes !== undefined);
+        const actualRemGigs = hasActualRem ? Number(Number(o.actual_remaining_gigabytes).toFixed(1)) : null;
+        const actualUsedGigs = (o.used_gigabytes !== null && o.used_gigabytes !== undefined)
+            ? Number(Number(o.used_gigabytes).toFixed(1))
+            : (hasActualRem ? parseFloat(Math.max(0, totalPkgGigs - (actualRemGigs || 0)).toFixed(1)) : null);
+
         res.json({
             success: true,
             data: {
@@ -495,7 +520,10 @@ app.get('/api/owners/:id', async (req, res) => {
                 assigned_gigabytes: assignedGigs,
                 package_gigabytes: totalPkgGigs,
                 total_gigabytes: totalPkgGigs,
-                remaining_gigabytes: parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1))
+                unassigned_gigabytes: unassignedGigs,
+                remaining_gigabytes: actualRemGigs !== null ? actualRemGigs : unassignedGigs,
+                actual_remaining_gigabytes: actualRemGigs,
+                used_gigabytes: actualUsedGigs
             }
         });
     } catch (e) {
@@ -544,38 +572,43 @@ app.post('/api/owners', async (req, res) => {
 
         const existing = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [phone]);
         let ownerId;
+        const actualRem = vfData.actual_remaining_gigabytes ?? null;
+        const actualUsed = vfData.used_gigabytes ?? null;
+        const usageJson = JSON.stringify(vfData);
+        const renewDate = vfData.renewableDate || null;
+
         try {
             if (existing) {
                 await dbRun(
-                    `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, status = 'نشط', notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || existing.notes || null, existing.id]
+                    `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, status = 'نشط', notes = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, usageJson, renewDate, notes || existing.notes || null, existing.id]
                 );
                 ownerId = existing.id;
             } else {
                 const result = await dbRun(
-                    `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, status, notes) VALUES (?, ?, ?, ?, ?, ?, 'نشط', ?)`,
-                    [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || null]
+                    `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, actual_remaining_gigabytes, used_gigabytes, last_usage_data, last_usage_at, renewable_date, status, notes, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 'نشط', ?, CURRENT_TIMESTAMP)`,
+                    [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, usageJson, renewDate, notes || null]
                 );
                 ownerId = result.lastID;
             }
         } catch (dbErr) {
-            if (String(dbErr.message).includes('total_gigabytes') || String(dbErr.message).includes('column')) {
-                await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS total_gigabytes INTEGER DEFAULT 0;').catch(() => {});
-                if (existing) {
-                    await dbRun(
-                        `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, status = 'نشط', notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                        [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || existing.notes || null, existing.id]
-                    );
-                    ownerId = existing.id;
-                } else {
-                    const result = await dbRun(
-                        `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, status, notes) VALUES (?, ?, ?, ?, ?, ?, 'نشط', ?)`,
-                        [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, notes || null]
-                    );
-                    ownerId = result.lastID;
-                }
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS actual_remaining_gigabytes REAL;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS used_gigabytes REAL;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_usage_data JSONB;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS last_usage_at TIMESTAMP;').catch(() => {});
+            await pool.query('ALTER TABLE owners ADD COLUMN IF NOT EXISTS renewable_date TEXT;').catch(() => {});
+            if (existing) {
+                await dbRun(
+                    `UPDATE owners SET password = ?, name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, status = 'نشط', notes = ?, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, usageJson, renewDate, notes || existing.notes || null, existing.id]
+                );
+                ownerId = existing.id;
             } else {
-                throw dbErr;
+                const result = await dbRun(
+                    `INSERT INTO owners (phone, password, name, plan, renewal_day, total_gigabytes, actual_remaining_gigabytes, used_gigabytes, last_usage_data, last_usage_at, renewable_date, status, notes, last_synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 'نشط', ?, CURRENT_TIMESTAMP)`,
+                    [phone, password, resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, actualRem, actualUsed, usageJson, renewDate, notes || null]
+                );
+                ownerId = result.lastID;
             }
         }
 
@@ -1692,16 +1725,16 @@ async function syncOwnerFamilyMembersToDb(ownerObj, vfData, resolvedName, resolv
             if (existing) {
                 const wasPending = (existing.status === 'محجوز' || existing.status === 'معلق');
                 await dbRun(
-                    `UPDATE bookings SET owner_id = ?, owner_phone = ?, owner_name = COALESCE(?, owner_name), gigabytes = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [ownerObj.id, ownerPhone, resolvedName || null, mGigs, resolvedRenewalDay, existing.id]
+                    `UPDATE bookings SET owner_id = ?, owner_phone = ?, owner_name = COALESCE(?, owner_name), gigabytes = ?, megabytes = ?, voice_minutes = ?, sms_count = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [ownerObj.id, ownerPhone, resolvedName || null, mGigs, m.megabytes || (mGigs * 1024), m.voice || 0, m.sms || 0, resolvedRenewalDay, existing.id]
                 );
                 if (wasPending) {
                     await onMemberInvitationAccepted(existing, ownerObj, resolvedName || ownerObj.name, mGigs, resolvedRenewalDay);
                 }
             } else {
                 await dbRun(
-                    `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-                    [ownerObj.id, ownerPhone, resolvedName || null, cleanM, mGigs, resolvedRenewalDay, `فرد (${cleanM.slice(-4)})`]
+                    `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, megabytes, voice_minutes, sms_count, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+                    [ownerObj.id, ownerPhone, resolvedName || null, cleanM, mGigs, m.megabytes || (mGigs * 1024), m.voice || 0, m.sms || 0, resolvedRenewalDay, `فرد (${cleanM.slice(-4)})`]
                 );
             }
             syncedCount++;
@@ -2396,8 +2429,8 @@ app.post('/api/family/sync-live', async (req, res) => {
         }
 
         await dbRun(
-            `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-            [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, owner.id]
+            `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
         );
 
         // Update owner_name on all bookings belonging to this owner
@@ -2437,12 +2470,29 @@ app.post('/api/family/sync-live', async (req, res) => {
             } catch (_) {}
         }
 
+        const rawOwner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [owner.id]);
         const updatedMembers = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
+        const assignedGigs = parseFloat(updatedMembers.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
+        const totalPkgGigs = parseFloat((Number(rawOwner.total_gigabytes) || 204.8).toFixed(1));
+        const unassignedGigs = parseFloat(Math.max(0, totalPkgGigs - assignedGigs).toFixed(1));
+        const enrichedOwner = {
+            ...rawOwner,
+            members: updatedMembers,
+            members_count: updatedMembers.length,
+            assigned_gigabytes: assignedGigs,
+            unassigned_gigabytes: unassignedGigs,
+            package_gigabytes: totalPkgGigs,
+            total_gigabytes: totalPkgGigs,
+            remaining_gigabytes: rawOwner.actual_remaining_gigabytes !== null && rawOwner.actual_remaining_gigabytes !== undefined ? Number(rawOwner.actual_remaining_gigabytes) : unassignedGigs,
+            actual_remaining_gigabytes: rawOwner.actual_remaining_gigabytes !== null && rawOwner.actual_remaining_gigabytes !== undefined ? Number(rawOwner.actual_remaining_gigabytes) : null,
+            used_gigabytes: rawOwner.used_gigabytes !== null && rawOwner.used_gigabytes !== undefined ? Number(rawOwner.used_gigabytes) : null
+        };
+
         res.json({
             success: true,
-            message: `تمت مزامنة ${syncedCount} أفراد وتحديث بيانات الأونر من فودافون بنجاح! 🔄`,
+            message: `تمت مزامنة ${syncedCount} أفراد وتحديث بيانات الأونر واستهلاك الباقة من فودافون بنجاح! 🔄`,
             data: {
-                owner: await dbGet(`SELECT * FROM owners WHERE id = ?`, [owner.id]),
+                owner: enrichedOwner,
                 members: updatedMembers
             }
         });
@@ -2491,8 +2541,8 @@ app.post('/api/owners/sync-all', async (req, res) => {
                 }
 
                 await dbRun(
-                    `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, owner.id]
+                    `UPDATE owners SET name = ?, plan = ?, renewal_day = ?, total_gigabytes = ?, actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ?, password_valid = TRUE, password_error = NULL, last_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                    [resolvedName, resolvedPlan, resolvedRenewalDay, resolvedTotalGB, vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
                 );
 
                 // Update owner_name on all bookings linked to this owner
@@ -3719,6 +3769,32 @@ async function fastVodafoneCheck(msisdn, password) {
         }
     }
 
+    const dataItem = quotaSummary.find((q) => q.key === "data") || quotaItems.find((i) => i.usageType?.toUpperCase() === "DATA" || i.entryType?.toUpperCase() === "DATA");
+    let actualRemainingGB = null;
+    let usedGB = null;
+    if (dataItem) {
+        const rawRem = Number(dataItem.remaining);
+        const rawUsed = Number(dataItem.used);
+        const u = String(dataItem.unit || 'MB').toUpperCase();
+        if (!isNaN(rawRem)) {
+            if (u === 'GB') actualRemainingGB = parseFloat(rawRem.toFixed(2));
+            else if (u === 'BYTE' || u === 'B' || rawRem > 5000000) actualRemainingGB = parseFloat((rawRem / (1024 * 1024 * 1024)).toFixed(2));
+            else if (u === 'KB') actualRemainingGB = parseFloat((rawRem / (1024 * 1024)).toFixed(2));
+            else actualRemainingGB = parseFloat((rawRem / 1024).toFixed(2));
+        }
+        if (!isNaN(rawUsed)) {
+            if (u === 'GB') usedGB = parseFloat(rawUsed.toFixed(2));
+            else if (u === 'BYTE' || u === 'B' || rawUsed > 5000000) usedGB = parseFloat((rawUsed / (1024 * 1024 * 1024)).toFixed(2));
+            else if (u === 'KB') usedGB = parseFloat((rawUsed / (1024 * 1024)).toFixed(2));
+            else usedGB = parseFloat((rawUsed / 1024).toFixed(2));
+        }
+    } else if (tariffItem) {
+        const rawRem = Number(tariffItem.remaining);
+        const rawUsed = Number(tariffItem.used);
+        if (!isNaN(rawRem)) actualRemainingGB = parseFloat((rawRem / 1024).toFixed(2));
+        if (!isNaN(rawUsed)) usedGB = parseFloat((rawUsed / 1024).toFixed(2));
+    }
+
     const data = {
         name: userInfo ? `${userInfo.firstName || ""} ${userInfo.lastName || ""}`.trim() : null,
         msisdn: userInfo?.msisdn || clean,
@@ -3731,6 +3807,9 @@ async function fastVodafoneCheck(msisdn, password) {
         renewableDate,
         renewal_day: renewalDay,
         total_gigabytes: totalGB,
+        actual_remaining_gigabytes: actualRemainingGB,
+        used_gigabytes: usedGB,
+        accessToken,
         familyInquiryOk,
         familyMembers,
         pendingInvites,
@@ -3744,70 +3823,233 @@ async function fastVodafoneCheck(msisdn, password) {
     return { valid: true, message: 'الباسورد صحيح وتم جلب الاستهلاك بنجاح ✅', details: data };
 }
 
+async function fetchVodafoneUsageForMsisdn(msisdn, accessToken, ownerMsisdn = null) {
+    if (!msisdn || !accessToken) return null;
+    let clean = String(msisdn).replace(/[\s-]/g, "");
+    if (clean.startsWith("+2")) clean = clean.substring(2);
+    else if (clean.startsWith("002")) clean = clean.substring(3);
+    const callerMsisdn = ownerMsisdn ? displayMsisdn(ownerMsisdn) : clean;
+
+    const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+    const usageUrl = `https://web.vodafone.com.eg/services/dxl/usage/usageConsumptionReport?bucket.product.publicIdentifier=${clean}&@type=aggregated`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+        const res = await fetch(usageUrl, {
+            headers: {
+                "User-Agent": ua,
+                Authorization: `Bearer ${accessToken}`,
+                clientId: "WebsiteConsumer",
+                msisdn: callerMsisdn,
+                "Accept-Language": "AR",
+                Accept: "application/json",
+                "Content-Type": "application/json",
+                Referer: "https://web.vodafone.com.eg/spa/familySharing"
+            },
+            signal: controller.signal
+        });
+        clearTimeout(timeout);
+        if (!res.ok) return null;
+        const raw = await res.json();
+        const quotaItems = parseUsageConsumptionResponse(raw);
+        const quotaSummary = buildUsageSummary(quotaItems);
+        const firstWithDate = quotaSummary.find((q) => q.renewableDate) || quotaItems.find((q) => q.renewableDate);
+        return {
+            quotaItems,
+            quotaSummary,
+            renewableDate: firstWithDate?.renewableDate || null,
+            fetchedAt: new Date().toISOString()
+        };
+    } catch (_) {
+        clearTimeout(timeout);
+        return null;
+    }
+}
+
+// Owner usage endpoint
+app.get('/api/owners/:id/usage', async (req, res) => {
+    try {
+        const owner = await dbGet('SELECT * FROM owners WHERE id = ?', [req.params.id]);
+        if (!owner) return res.status(404).json({ success: false, error: 'الأونر غير موجود' });
+
+        if (owner.last_usage_data && req.query.fresh !== '1') {
+            const ageMs = owner.last_usage_at ? (Date.now() - new Date(owner.last_usage_at).getTime()) : Infinity;
+            if (ageMs < 180000) {
+                const parsed = typeof owner.last_usage_data === 'string' ? JSON.parse(owner.last_usage_data) : owner.last_usage_data;
+                return res.json({ success: true, data: parsed, cached: true });
+            }
+        }
+
+        const vf = await fastVodafoneCheck(owner.phone, owner.password);
+        if (!vf.valid) {
+            if (owner.last_usage_data) {
+                const parsed = typeof owner.last_usage_data === 'string' ? JSON.parse(owner.last_usage_data) : owner.last_usage_data;
+                return res.json({ success: true, data: parsed, cached: true, warning: vf.message });
+            }
+            return res.status(400).json({ success: false, error: vf.message || 'تعذر جلب الاستهلاك من فودافون' });
+        }
+
+        const vfData = vf.details || {};
+        await dbRun(
+            `UPDATE owners SET actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ? WHERE id = ?`,
+            [vfData.actual_remaining_gigabytes ?? null, vfData.used_gigabytes ?? null, JSON.stringify(vfData), vfData.renewableDate || null, owner.id]
+        );
+        res.json({ success: true, data: vfData });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 // Unified Real-time Usage Consumption Endpoint (for Customer Dashboard & Admin/Employee Panel)
 app.post('/api/usage', async (req, res) => {
     try {
-        let { booking_id, phone, password } = req.body || {};
+        let { booking_id, phone, password, owner_id } = req.body || {};
+        let cleanPhone = phone ? toEnglish(String(phone).trim().replace(/[\s-]/g, '')) : '';
+
+        // 1. If checking an owner directly
+        if (owner_id || (cleanPhone && cleanPhone.length >= 10)) {
+            const ownerRow = await dbGet(`SELECT * FROM owners WHERE id = ? OR phone = ?`, [owner_id || null, cleanPhone]);
+            if (ownerRow && (owner_id || (!booking_id && !password))) {
+                const vf = await fastVodafoneCheck(ownerRow.phone, ownerRow.password);
+                if (vf.valid && vf.details) {
+                    await dbRun(
+                        `UPDATE owners SET actual_remaining_gigabytes = ?, used_gigabytes = ?, last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP, renewable_date = ? WHERE id = ?`,
+                        [vf.details.actual_remaining_gigabytes ?? null, vf.details.used_gigabytes ?? null, JSON.stringify(vf.details), vf.details.renewableDate || null, ownerRow.id]
+                    );
+                    return res.json({
+                        success: true,
+                        message: vf.message,
+                        data: {
+                            ...vf.details,
+                            isOwner: true,
+                            owner: ownerRow
+                        }
+                    });
+                }
+                if (ownerRow.last_usage_data) {
+                    const parsed = typeof ownerRow.last_usage_data === 'string' ? JSON.parse(ownerRow.last_usage_data) : ownerRow.last_usage_data;
+                    return res.json({
+                        success: true,
+                        cached: true,
+                        message: 'تم عرض آخر استهلاك مسجل للأونر',
+                        data: { ...parsed, isOwner: true, owner: ownerRow }
+                    });
+                }
+            }
+        }
+
+        // 2. Member booking
         let bookingRow = null;
-
-        if (booking_id && (!phone || !password)) {
+        if (booking_id) {
             bookingRow = await dbGet(`SELECT * FROM bookings WHERE id = ?`, [booking_id]);
-            if (bookingRow) {
-                phone = phone || bookingRow.phone;
-                password = password || bookingRow.password;
-            }
         }
-
-        if (phone && !password) {
-            const cleanPhone = toEnglish(String(phone).trim());
+        if (!bookingRow && cleanPhone) {
             bookingRow = await dbGet(`SELECT * FROM bookings WHERE phone = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`, [cleanPhone]);
-            if (bookingRow) {
-                password = bookingRow.password;
+        }
+
+        if (bookingRow) {
+            cleanPhone = cleanPhone || bookingRow.phone;
+            password = password || bookingRow.password;
+        }
+
+        // A) If member has password, check member directly
+        if (cleanPhone && password && password.trim()) {
+            const result = await fastVodafoneCheck(cleanPhone, password.trim());
+            if (result.valid && result.details) {
+                if (bookingRow) {
+                    try {
+                        const memberName = result.details.name || null;
+                        await dbRun(
+                            `UPDATE bookings SET name = COALESCE(?, name), last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                            [memberName, JSON.stringify(result.details), bookingRow.id]
+                        );
+                    } catch (_) {}
+                }
+                return res.json({
+                    success: true,
+                    message: result.message,
+                    data: {
+                        ...result.details,
+                        booking: bookingRow ? {
+                            id: bookingRow.id,
+                            phone: bookingRow.phone,
+                            gigabytes: bookingRow.gigabytes,
+                            renewal_day: bookingRow.renewal_day,
+                            status: bookingRow.status
+                        } : null
+                    }
+                });
             }
         }
 
-        if (!phone || !password) {
+        // B) If member does NOT have password, try via owner!
+        if (bookingRow && (bookingRow.owner_id || bookingRow.owner_phone)) {
+            const owner = await dbGet(`SELECT * FROM owners WHERE id = ? OR phone = ?`, [bookingRow.owner_id, bookingRow.owner_phone]);
+            if (owner && owner.password) {
+                const ownerVf = await fastVodafoneCheck(owner.phone, owner.password);
+                if (ownerVf.valid && ownerVf.details?.accessToken) {
+                    const memberUsage = await fetchVodafoneUsageForMsisdn(cleanPhone, ownerVf.details.accessToken, owner.phone);
+                    if (memberUsage) {
+                        await dbRun(
+                            `UPDATE bookings SET last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                            [JSON.stringify(memberUsage), bookingRow.id]
+                        );
+                        return res.json({
+                            success: true,
+                            message: 'تم جلب استهلاك الفرد بنجاح عبر حساب الأونر ✅',
+                            data: {
+                                ...memberUsage,
+                                name: bookingRow.name,
+                                currentPlan: 'باقة فودافون ريد (عضو)',
+                                booking: {
+                                    id: bookingRow.id,
+                                    phone: bookingRow.phone,
+                                    gigabytes: bookingRow.gigabytes,
+                                    renewal_day: bookingRow.renewal_day,
+                                    status: bookingRow.status
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        // C) Fallback to cached usage if available
+        if (bookingRow && bookingRow.last_usage_data) {
+            const parsed = typeof bookingRow.last_usage_data === 'string' ? JSON.parse(bookingRow.last_usage_data) : bookingRow.last_usage_data;
+            return res.json({
+                success: true,
+                cached: true,
+                message: `تم عرض آخر استهلاك تم سحبه للفرد (${bookingRow.last_usage_at ? String(bookingRow.last_usage_at).split(' ')[0] : 'سابقاً'})`,
+                data: {
+                    ...parsed,
+                    name: bookingRow.name,
+                    booking: {
+                        id: bookingRow.id,
+                        phone: bookingRow.phone,
+                        gigabytes: bookingRow.gigabytes,
+                        renewal_day: bookingRow.renewal_day,
+                        status: bookingRow.status
+                    }
+                }
+            });
+        }
+
+        if (!password) {
             return res.status(400).json({
                 success: false,
-                need_password: !password,
-                error: !password ? 'باسورد الفرد غير مسجل. يرجى إضافة باسورد الفرد لعرض الاستهلاك بدون أي مشكلة.' : 'رقم الموبايل مطلوب.'
+                need_password: true,
+                error: 'باسورد الفرد غير مسجل ولا يمكن سحب استهلاكه حالياً بدون باسورد أنا فودافون.'
             });
         }
 
-        const result = await fastVodafoneCheck(toEnglish(String(phone).trim()), String(password).trim());
-        if (!result.valid) {
-            return res.json({
-                success: false,
-                error: result.message || 'فشل تسجيل الدخول في فودافون (تأكد من صحة باسورد أنا فودافون).'
-            });
-        }
-
-        // Cache usage and subscriber name in database
-        if (bookingRow && result.details) {
-            try {
-                const memberName = result.details.name || null;
-                await dbRun(`UPDATE bookings SET name = COALESCE(?, name), last_usage_data = ?, last_usage_at = CURRENT_TIMESTAMP WHERE id = ?`, [memberName, JSON.stringify(result.details), bookingRow.id]);
-            } catch (cacheErr) {
-                console.error('Usage cache error:', cacheErr.message);
-            }
-        }
-
-        return res.json({
-            success: true,
-            message: result.message,
-            data: {
-                ...(result.details || {}),
-                booking: bookingRow ? {
-                    id: bookingRow.id,
-                    phone: bookingRow.phone,
-                    gigabytes: bookingRow.gigabytes,
-                    renewal_day: bookingRow.renewal_day,
-                    status: bookingRow.status
-                } : null
-            }
+        return res.status(400).json({
+            success: false,
+            error: 'تعذر جلب الاستهلاك من فودافون (تأكد من صحة الباسورد)'
         });
     } catch (e) {
-        console.error('Error in /api/usage:', e);
         return res.status(500).json({ success: false, error: 'حدث خطأ أثناء جلب الاستهلاك: ' + e.message });
     }
 });
