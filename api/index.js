@@ -445,7 +445,7 @@ app.get('/api/owners', async (req, res) => {
     try {
         const owners = await dbAll(`SELECT * FROM owners ORDER BY id DESC`);
         const ownersWithMembers = await Promise.all(owners.map(async (o) => {
-            const members = await dbAll(
+            const rawMembersList = await dbAll(
                 `SELECT b.*, 
                  (SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as renewal_count
                  FROM bookings b 
@@ -453,6 +453,15 @@ app.get('/api/owners', async (req, res) => {
                  ORDER BY b.id DESC`,
                 [o.id, o.phone]
             );
+            const seenPhones = new Set();
+            const members = [];
+            for (const m of rawMembersList) {
+                const clean = displayMsisdn(m.phone);
+                if (clean && !seenPhones.has(clean)) {
+                    seenPhones.add(clean);
+                    members.push(m);
+                }
+            }
             const activeMembers = members.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
             const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : members).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
             const nextAssignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.next_gigabytes || m.gigabytes) || 0), 0).toFixed(1));
@@ -512,7 +521,7 @@ app.get('/api/owners/:id', async (req, res) => {
     try {
         const o = await dbGet(`SELECT * FROM owners WHERE id = ?`, [req.params.id]);
         if (!o) return res.status(404).json({ success: false, error: 'الأونر غير موجود' });
-        const members = await dbAll(
+        const rawMembersList = await dbAll(
             `SELECT b.*, 
              (SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as renewal_count
              FROM bookings b 
@@ -520,6 +529,15 @@ app.get('/api/owners/:id', async (req, res) => {
              ORDER BY b.id DESC`,
             [o.id, o.phone]
         );
+        const seenPhones = new Set();
+        const members = [];
+        for (const m of rawMembersList) {
+            const clean = displayMsisdn(m.phone);
+            if (clean && !seenPhones.has(clean)) {
+                seenPhones.add(clean);
+                members.push(m);
+            }
+        }
         const activeMembers = members.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
         const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : members).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
         let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
@@ -1819,29 +1837,48 @@ async function syncOwnerFamilyMembersToDb(ownerObj, vfData, resolvedName, resolv
     const syncedPhones = [];
     const ownerPhone = displayMsisdn(ownerObj.phone);
 
+    const activeLivePhones = new Set();
+    const pendingLivePhones = new Set();
+
     if (Array.isArray(vfData?.familyMembers)) {
         for (const m of vfData.familyMembers) {
             if (!m.phone) continue;
             const cleanM = displayMsisdn(m.phone);
+            activeLivePhones.add(cleanM);
             const mGigs = m.gigabytes || 20;
-            const existing = await dbGet(
-                `SELECT id, status, phone, gigabytes, renewal_day, name, owner_id, owner_phone, deleted_at FROM bookings WHERE phone = ?`,
+
+            const existingRows = await dbAll(
+                `SELECT id, status, phone, gigabytes, renewal_day, name, owner_id, owner_phone, deleted_at FROM bookings WHERE phone = ? ORDER BY id DESC`,
                 [cleanM]
             );
-            if (existing) {
-                const wasPending = (existing.status === 'محجوز' || existing.status === 'معلق');
+
+            let primaryId = null;
+            if (existingRows.length > 0) {
+                const matchRow = existingRows.find(r => r.owner_id === ownerObj.id || r.owner_phone === ownerPhone) || existingRows[0];
+                primaryId = matchRow.id;
+                const wasPending = (matchRow.status === 'محجوز' || matchRow.status === 'معلق');
+
                 await dbRun(
                     `UPDATE bookings SET deleted_at = NULL, owner_id = ?, owner_phone = ?, owner_name = COALESCE(?, owner_name), gigabytes = ?, megabytes = ?, voice_minutes = ?, sms_count = ?, renewal_day = ?, status = 'متأكتف', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-                    [ownerObj.id, ownerPhone, resolvedName || null, mGigs, m.megabytes || (mGigs * 1024), m.voice || 0, m.sms || 0, resolvedRenewalDay, existing.id]
+                    [ownerObj.id, ownerPhone, resolvedName || null, mGigs, m.megabytes || (mGigs * 1024), m.voice || 0, m.sms || 0, resolvedRenewalDay, primaryId]
                 );
                 if (wasPending) {
-                    await onMemberInvitationAccepted(existing, ownerObj, resolvedName || ownerObj.name, mGigs, resolvedRenewalDay);
+                    await onMemberInvitationAccepted(matchRow, ownerObj, resolvedName || ownerObj.name, mGigs, resolvedRenewalDay);
+                }
+
+                // If older duplicate rows exist with the same phone, soft-delete them to keep one active line
+                if (existingRows.length > 1) {
+                    await dbRun(
+                        `UPDATE bookings SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE phone = ? AND id != ? AND deleted_at IS NULL`,
+                        [cleanM, primaryId]
+                    );
                 }
             } else {
-                await dbRun(
+                const insertRes = await dbRun(
                     `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, megabytes, voice_minutes, sms_count, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'متأكتف', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
                     [ownerObj.id, ownerPhone, resolvedName || null, cleanM, mGigs, m.megabytes || (mGigs * 1024), m.voice || 0, m.sms || 0, resolvedRenewalDay, `فرد (${cleanM.slice(-4)})`]
                 );
+                primaryId = insertRes.lastID;
             }
             syncedCount++;
             syncedPhones.push(cleanM);
@@ -1853,9 +1890,10 @@ async function syncOwnerFamilyMembersToDb(ownerObj, vfData, resolvedName, resolv
         for (const p of vfData.pendingInvites) {
             if (!p.phone) continue;
             const cleanP = displayMsisdn(p.phone);
+            pendingLivePhones.add(cleanP);
             const pExisting = await dbGet(`SELECT id, status, deleted_at FROM bookings WHERE phone = ?`, [cleanP]);
             if (pExisting) {
-                if (pExisting.deleted_at) {
+                if (pExisting.deleted_at || pExisting.status !== 'محجوز') {
                     await dbRun(`UPDATE bookings SET deleted_at = NULL, owner_id = ?, owner_phone = ?, owner_name = COALESCE(?, owner_name), status = 'محجوز', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [ownerObj.id, ownerPhone, resolvedName || null, pExisting.id]);
                 }
             } else {
@@ -1863,6 +1901,34 @@ async function syncOwnerFamilyMembersToDb(ownerObj, vfData, resolvedName, resolv
                     `INSERT INTO bookings (owner_id, owner_phone, owner_name, phone, gigabytes, renewal_day, status, name, created_at, updated_at) VALUES (?, ?, ?, ?, 20, ?, 'محجوز', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
                     [ownerObj.id, ownerPhone, resolvedName || null, cleanP, resolvedRenewalDay, `دعوة معلقة (${cleanP.slice(-4)})`]
                 );
+            }
+        }
+    }
+
+    // CRITICAL: Clean up phantom/removed members!
+    // If Vodafone customer group inquiry succeeded (familyInquiryOk), Vodafone is the single source of truth.
+    // Any booking assigned to this owner in DB that is neither an active member nor a pending invite in Vodafone MUST be archived!
+    if (vfData?.familyInquiryOk) {
+        const currentDbMembers = await dbAll(
+            `SELECT id, phone, name, status FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL`,
+            [ownerObj.id, ownerPhone]
+        );
+        for (const dbM of currentDbMembers) {
+            const dbPhone = displayMsisdn(dbM.phone);
+            if (!activeLivePhones.has(dbPhone)) {
+                if (pendingLivePhones.has(dbPhone)) {
+                    if (dbM.status !== 'محجوز') {
+                        await dbRun(`UPDATE bookings SET status = 'محجوز', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [dbM.id]);
+                    }
+                } else {
+                    // This number does NOT exist in Vodafone's family! It is a phantom/removed member!
+                    await dbRun(
+                        `UPDATE bookings SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                        [dbM.id]
+                    );
+                    archivedCount++;
+                    console.log(`[SYNC_CLEANUP] Archived ghost/removed member ${dbPhone} (ID: ${dbM.id}) from owner ${ownerPhone} - not in Vodafone family.`);
+                }
             }
         }
     }
@@ -2568,7 +2634,16 @@ app.post('/api/family/sync-live', async (req, res) => {
         );
 
         const rawOwner = await dbGet(`SELECT * FROM owners WHERE id = ?`, [owner.id]);
-        const updatedMembers = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
+        const rawUpdatedMembers = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
+        const seenLivePhones = new Set();
+        const updatedMembers = [];
+        for (const m of rawUpdatedMembers) {
+            const clean = displayMsisdn(m.phone);
+            if (clean && !seenLivePhones.has(clean)) {
+                seenLivePhones.add(clean);
+                updatedMembers.push(m);
+            }
+        }
         const activeMembers = updatedMembers.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
         const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : updatedMembers).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
         let totalPkgGigs = parseFloat((Number(rawOwner.total_gigabytes) || assignedGigs || 0).toFixed(1));
@@ -3828,6 +3903,13 @@ async function fastVodafoneCheck(msisdn, password) {
                     const rawStatus = String(rm.status ?? "").toLowerCase().trim();
                     if (rawStatus === "5" || rawStatus === "pending" || rawStatus === "invited") {
                         pendingInvites.push({ phone: memberPhone, type: rm.type || "Member", status: "pending" });
+                        continue;
+                    }
+
+                    // In Vodafone DXL customerGroup, ONLY status === "1" (or "active") represents an active member!
+                    // Statuses 0, 2, 3, "cancelled", "removed", "inactive" are historical/deleted records retained by Vodafone.
+                    if (rawStatus !== "1" && rawStatus !== "active") {
+                        inactiveMembers.push({ phone: memberPhone, type: rm.type || "Member", status: rawStatus || "inactive" });
                         continue;
                     }
 
