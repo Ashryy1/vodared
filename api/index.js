@@ -463,6 +463,7 @@ app.get('/api/owners', async (req, res) => {
                 }
             }
             const activeMembers = members.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
+            const pendingMembers = members.filter(m => m.status === 'محجوز' || m.status === 'معلق');
             const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : members).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
             const nextAssignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.next_gigabytes || m.gigabytes) || 0), 0).toFixed(1));
             let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
@@ -496,7 +497,9 @@ app.get('/api/owners', async (req, res) => {
             return {
                 ...o,
                 members,
-                members_count: activeMembers.length > 0 ? activeMembers.length : members.length,
+                members_count: members.length,
+                active_members_count: activeMembers.length,
+                pending_members_count: pendingMembers.length,
                 assigned_gigabytes: assignedGigs,
                 next_assigned_gigabytes: nextAssignedGigs,
                 package_gigabytes: totalPkgGigs,
@@ -539,6 +542,7 @@ app.get('/api/owners/:id', async (req, res) => {
             }
         }
         const activeMembers = members.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
+        const pendingMembers = members.filter(m => m.status === 'محجوز' || m.status === 'معلق');
         const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : members).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
         let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
         if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205)) {
@@ -572,7 +576,9 @@ app.get('/api/owners/:id', async (req, res) => {
             data: {
                 ...o,
                 members,
-                members_count: activeMembers.length > 0 ? activeMembers.length : members.length,
+                members_count: members.length,
+                active_members_count: activeMembers.length,
+                pending_members_count: pendingMembers.length,
                 assigned_gigabytes: assignedGigs,
                 package_gigabytes: totalPkgGigs,
                 total_gigabytes: totalPkgGigs,
@@ -900,7 +906,7 @@ async function authenticateVodafoneOwner(phone, password) {
 
     // Check for WAF or server errors first
     if (postResp.status === 555 || postText.includes('The requested URL was rejected') || postText.includes('Request Rejected')) {
-        return { success: false, isNetworkError: true, message: 'رفضت بوابة الحماية (WAF) في فودافون الطلب مؤقتاً، يرجى المحاولة بعد قليل' };
+        return { success: false, isNetworkError: true, message: 'رفض سيرفر فودافون تسجيل الدخول مؤقتاً (555)، يرجى إعادة المحاولة بعد قليل' };
     }
     if (postResp.status === 429 || postText.includes('Too Many Requests')) {
         return { success: false, isNetworkError: true, message: 'تم تجاوز معدل المحاولات المسموح به مؤقتاً في فودافون (429)، يرجى الانتظار دقيقة' };
@@ -1114,8 +1120,11 @@ function extractVodafoneError(respData, status) {
     if (!raw) return null;
 
     const lower = raw.toLowerCase();
-    if (lower.includes("request rejected") || lower.includes("the requested url was rejected") || lower.includes("<html")) {
-        return "رفضت بوابة الحماية (WAF) في فودافون الطلب مؤقتاً، يرجى المحاولة بعد قليل";
+    if (lower.includes("request rejected") || lower.includes("the requested url was rejected")) {
+        return "رفضت شبكة فودافون الطلب (555 Rejected). تأكد أن خط الأونر مؤهل لباقة العائلة ورصيد باقته كافٍ";
+    }
+    if (lower.includes("<html")) {
+        return "سيرفرات فودافون غير مستجيبة حالياً، يرجى المحاولة بعد قليل";
     }
     if (lower.includes("different billing accounts")) {
         return "رقم الفرد يتبع حساب فواتير مختلف ولا يمكن ضمه لنفس باقة العائلة";
@@ -1226,6 +1235,12 @@ async function sendVodafoneFamilyInvitation(owner, memberPhone, quotaGB, minutes
     let context = { roleName: "EnterpriseRedFamily", categories: [], members: [] };
     try {
         context = await resolveVodafoneFamilyContext(owner, cleanMemberPhone);
+        if (context.hasFamilyGroup === false) {
+            return {
+                success: false,
+                error: context.error || `خط الأونر (${cleanOwnerPhone}) غير مفعل عليه باقة عائلة في شبكة فودافون (${owner.plan || 'باقة غير مدعومة'}). يرجى التأكد من باقة الخط لدى فودافون.`
+            };
+        }
         if (context.matchedMember && (String(context.matchedMember.status) === '1' || String(context.matchedMember.status) === '5')) {
             return {
                 success: false,
@@ -1345,6 +1360,19 @@ async function resolveVodafoneFamilyContext(owner, targetMemberPhone = null) {
             "GET"
         );
         const fg = Array.isArray(inquiryResp.data) ? inquiryResp.data[0] : inquiryResp.data;
+        if (inquiryResp.status === 404 || (fg && (fg.code === "1001" || fg.reason === "No Data Found"))) {
+            return {
+                hasFamilyGroup: false,
+                roleName,
+                categories,
+                templateCategory,
+                inquiryConfirmedMembers: false,
+                members: [],
+                ownerMember: null,
+                matchedMember: null,
+                error: `خط الأونر (${owner.phone}) غير مفعل عليه باقة عائلة في شبكة فودافون (${owner.plan || 'No Family Group'}). يرجى التأكد من تفعيل باقة العائلة للخط أولاً.`
+            };
+        }
         if (inquiryResp.ok && fg && typeof fg === "object") {
             roleName = normalizeVodafoneFamilyRole(fg.name, owner?.plan);
             if (Array.isArray(fg.category) && fg.category.length > 0) {
