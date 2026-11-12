@@ -457,7 +457,7 @@ app.get('/api/owners', async (req, res) => {
             const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : members).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
             const nextAssignedGigs = parseFloat(members.reduce((sum, m) => sum + (Number(m.next_gigabytes || m.gigabytes) || 0), 0).toFixed(1));
             let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
-            if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205) || (!totalPkgGigs && o.plan?.includes('3000'))) {
+            if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205)) {
                 totalPkgGigs = 204.8;
             }
 
@@ -523,7 +523,7 @@ app.get('/api/owners/:id', async (req, res) => {
         const activeMembers = members.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
         const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : members).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
         let totalPkgGigs = parseFloat((Number(o.total_gigabytes) || assignedGigs).toFixed(1));
-        if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205) || (!totalPkgGigs && o.plan?.includes('3000'))) {
+        if (totalPkgGigs === 200 || (totalPkgGigs > 195 && totalPkgGigs < 205)) {
             totalPkgGigs = 204.8;
         }
 
@@ -596,7 +596,7 @@ app.post('/api/owners', async (req, res) => {
         const resolvedRenewalDay = vfData.renewal_day || (renewal_day && Number(renewal_day) !== 7 ? Number(renewal_day) : 11);
         let resolvedTotalGB = vfData.total_gigabytes || 0;
         resolvedTotalGB = Number(resolvedTotalGB) || 0;
-        if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205) || (!resolvedTotalGB && String(resolvedPlan || '').includes('3000'))) {
+        if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205)) {
             resolvedTotalGB = 204.8;
         }
 
@@ -1272,7 +1272,7 @@ async function resolveVodafoneFamilyContext(owner, targetMemberPhone = null) {
     try {
         const inquiryResp = await callVodafoneForOwner(
             owner,
-            `${VODAFONE_CUSTOMER_GROUP_URL}?type=Family&$.parts.member.type=owner`,
+            `${VODAFONE_CUSTOMER_GROUP_URL}?type=Family`,
             "GET"
         );
         const fg = Array.isArray(inquiryResp.data) ? inquiryResp.data[0] : inquiryResp.data;
@@ -1327,11 +1327,10 @@ async function removeVodafoneFamilyMember(owner, memberPhone, opts = {}) {
 
     const executeRemovalAction = async (actionType) => {
         const isCancel = actionType === "CancelInvitation";
-        const method = isCancel ? "POST" : "PATCH";
         const memberIdVal = ctx.matchedMember?.id?.[0]?.value || formattedMember;
         const primaryOwnerVal = ctx.ownerMember?.id?.[0]?.value || formattedOwner;
 
-        const sendRemoval = async (ownerVal) => {
+        const sendRemoval = async (ownerVal, method = "POST") => {
             const parts = {
                 member: [
                     { id: [{ value: ownerVal, schemeName: "MSISDN" }], type: "Owner" },
@@ -1358,10 +1357,21 @@ async function removeVodafoneFamilyMember(owner, memberPhone, opts = {}) {
             return await callVodafoneForOwner(owner, VODAFONE_CUSTOMER_GROUP_URL, method, payload);
         };
 
-        let resp = await sendRemoval(primaryOwnerVal);
+        // Try POST first (Vodafone DXL actions use POST and WAF doesn't block POST on this endpoint)
+        let resp = await sendRemoval(primaryOwnerVal, "POST");
+        if (!resp.ok && (resp.status === 405 || resp.status === 400 || resp.status === 404)) {
+            console.log(`[REMOVE_MEMBER] Retrying with PATCH for owner ${primaryOwnerVal} after status ${resp.status}...`);
+            const patchResp = await sendRemoval(primaryOwnerVal, "PATCH");
+            if (patchResp.ok || patchResp.status === 200 || patchResp.status === 201 || patchResp.status === 204) {
+                resp = patchResp;
+            } else if (patchResp.status !== 555 && patchResp.status !== 405) {
+                resp = patchResp;
+            }
+        }
+
         if (!resp.ok && (resp.status === 400 || resp.status === 404)) {
             console.log(`[REMOVE_MEMBER] Retrying with 11-digit owner MSISDN (${cleanOwnerPhone}) after status ${resp.status}...`);
-            const retryResp = await sendRemoval(cleanOwnerPhone);
+            const retryResp = await sendRemoval(cleanOwnerPhone, "POST");
             if (retryResp.ok || retryResp.status === 200 || retryResp.status === 201 || retryResp.status === 204 || retryResp.status !== 404) {
                 resp = retryResp;
             }
@@ -1371,7 +1381,7 @@ async function removeVodafoneFamilyMember(owner, memberPhone, opts = {}) {
             return { success: true, result: resp.data };
         }
         const err = extractVodafoneError(resp.data, resp.status) || `فشل الطلب مع كود ${resp.status}`;
-        if (/not found|لا توجد|already|غير موجود|not a member/i.test(err)) {
+        if (/not found|لا توجد|already|غير موجود|not a member|مسبقا/i.test(err)) {
             return { success: true, alreadyRemoved: true };
         }
         return { success: false, error: err };
@@ -2153,13 +2163,15 @@ async function handleDeleteMember(req, res) {
             return res.status(404).json({ success: false, error: 'الفرد غير موجود' });
         }
 
-        // If owner exists, perform real removal on Vodafone DXL network!
+        const force = req.query?.force === 'true' || req.body?.force === true;
+
+        // If owner exists and not forced, perform real removal on Vodafone DXL network!
         let owner = null;
         if (ownerPhone) {
             owner = await dbGet(`SELECT * FROM owners WHERE phone = ?`, [displayMsisdn(ownerPhone)]);
         }
 
-        if (owner && owner.password) {
+        if (owner && owner.password && !force) {
             const isPendingInvite =
                 member?.status === 'محجوز' ||
                 member?.status === 'قيد الانتظار' ||
@@ -2168,6 +2180,7 @@ async function handleDeleteMember(req, res) {
             if (!remRes.success) {
                 return res.status(400).json({
                     success: false,
+                    canForceDelete: true,
                     error: `رفضت شبكة فودافون إزالة العضو: ${remRes.error}`
                 });
             }
@@ -2182,7 +2195,9 @@ async function handleDeleteMember(req, res) {
 
         res.json({
             success: true,
-            message: `تمت إزالة العضو ${memberPhone} رسمياً من شبكة فودافون واسترجاع حصصه للأونر بنجاح! 🗑️`
+            message: force
+                ? `تم حذف العضو ${memberPhone} من قاعدة بيانات النظام بنجاح! 🗑️`
+                : `تمت إزالة العضو ${memberPhone} رسمياً من شبكة فودافون واسترجاع حصصه للأونر بنجاح! 🗑️`
         });
     } catch (e) {
         console.error('handleDeleteMember error:', e);
@@ -2237,7 +2252,7 @@ app.post('/api/members/:id/next-quota', async (req, res) => {
             );
             const otherAssignedNext = otherMembers.reduce((sum, m) => sum + Number(m.next_gigabytes || m.gigabytes || 0), 0);
             let maxOwnerGB = Number(owner.total_gigabytes) || 0;
-            if (maxOwnerGB === 200 || (maxOwnerGB >= 195 && maxOwnerGB <= 205) || (!maxOwnerGB && String(owner.plan || '').includes('3000'))) {
+            if (maxOwnerGB === 200 || (maxOwnerGB >= 195 && maxOwnerGB <= 205)) {
                 maxOwnerGB = 204.8;
             }
             if (!maxOwnerGB) maxOwnerGB = (otherAssignedNext + Number(member.gigabytes));
@@ -2469,7 +2484,7 @@ app.post('/api/family/sync-live', async (req, res) => {
         const resolvedRenewalDay = vfData.renewal_day || owner.renewal_day;
         let resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
         resolvedTotalGB = Number(resolvedTotalGB) || 0;
-        if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205) || (!resolvedTotalGB && String(resolvedPlan || owner.plan || '').includes('3000'))) {
+        if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205)) {
             resolvedTotalGB = 204.8;
         }
 
@@ -2519,7 +2534,10 @@ app.post('/api/family/sync-live', async (req, res) => {
         const updatedMembers = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
         const activeMembers = updatedMembers.filter(m => m.status === 'متأكتف' || (!m.status && !m.deleted_at));
         const assignedGigs = parseFloat((activeMembers.length > 0 ? activeMembers : updatedMembers).reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0).toFixed(1));
-        const totalPkgGigs = parseFloat((Number(rawOwner.total_gigabytes) || 204.8).toFixed(1));
+        let totalPkgGigs = parseFloat((Number(rawOwner.total_gigabytes) || assignedGigs || 0).toFixed(1));
+        if (totalPkgGigs === 200 || (totalPkgGigs >= 195 && totalPkgGigs <= 205)) {
+            totalPkgGigs = 204.8;
+        }
 
         let unassignedGigs;
         let unassignedDisplay;
@@ -2599,7 +2617,7 @@ app.post('/api/owners/sync-all', async (req, res) => {
                 const resolvedRenewalDay = vfData.renewal_day || owner.renewal_day;
                 let resolvedTotalGB = vfData.total_gigabytes || owner.total_gigabytes;
                 resolvedTotalGB = Number(resolvedTotalGB) || 0;
-                if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205) || (!resolvedTotalGB && String(resolvedPlan || owner.plan || '').includes('3000'))) {
+                if (resolvedTotalGB === 200 || (resolvedTotalGB >= 195 && resolvedTotalGB <= 205)) {
                     resolvedTotalGB = 204.8;
                 }
 
@@ -2698,7 +2716,7 @@ app.get('/api/family', async (req, res) => {
         const members = await dbAll(`SELECT * FROM bookings WHERE (owner_id = ? OR owner_phone = ?) AND deleted_at IS NULL ORDER BY id ASC`, [owner.id, owner.phone]);
         const assignedGigs = members.reduce((sum, m) => sum + (Number(m.gigabytes) || 0), 0);
         let totalGigs = Number(owner.total_gigabytes) || 0;
-        if (totalGigs === 200 || (totalGigs >= 195 && totalGigs <= 205) || (!totalGigs && String(owner.plan || '').includes('3000'))) {
+        if (totalGigs === 200 || (totalGigs >= 195 && totalGigs <= 205)) {
             totalGigs = 204.8;
         }
         if (!totalGigs) totalGigs = (assignedGigs + 100);
