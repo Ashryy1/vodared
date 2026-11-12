@@ -284,9 +284,57 @@ function isInPaymentWindow(renewalDay) {
 }
 
 // Package prices (Configurable dynamically by Super Admin)
-const DEFAULT_PACKAGE_PRICES = { 20: 250, 30: 350, 40: 450, 60: 600, 70: 700, 85: 800 };
+const DEFAULT_PACKAGE_PRICES = { 20: 250, 30: 350, 40: 450, 50: 550, 60: 600, 70: 700, 85: 800, 100: 950 };
 let packagePricesCache = null;
 let packagePricesCacheTime = 0;
+
+/**
+ * Intelligent package tier resolver:
+ * Matches exact gigabytes first. If a member's line has slightly more/less gigabytes
+ * (e.g. 31 GB, 32 GB, 29 GB, 41 GB, 21 GB, 84 GB) due to pool division, resolves
+ * to the closest standard or configured tier within tolerance (±3.5 GB).
+ */
+function resolvePackageTier(rawGigs, availablePrices = {}) {
+    const g = parseFloat(rawGigs);
+    if (isNaN(g) || g <= 0) return 0;
+
+    const intG = Math.round(g);
+    // 1. Exact match
+    if (availablePrices[g] !== undefined) return g;
+    if (availablePrices[intG] !== undefined) return intG;
+    if (availablePrices[String(intG)] !== undefined) return intG;
+
+    // 2. Collect all available tier points
+    const configuredTiers = Object.keys(availablePrices)
+        .map(k => Number(k))
+        .filter(n => !isNaN(n) && n > 0);
+    const standardTiers = [20, 30, 40, 50, 60, 70, 85, 100];
+    const allTiers = Array.from(new Set([...configuredTiers, ...standardTiers])).sort((a, b) => a - b);
+
+    // 3. Closest tier within ±3.5 GB (covers 31, 32, 29, 28 for 30; 41, 42, 39 for 40, etc.)
+    let bestTier = null;
+    let minDiff = Infinity;
+    for (const tier of allTiers) {
+        const diff = Math.abs(g - tier);
+        if (diff <= 3.5 && diff < minDiff) {
+            minDiff = diff;
+            bestTier = tier;
+        }
+    }
+    if (bestTier !== null) return bestTier;
+
+    // 4. Extended tolerance up to ±5 GB (e.g. 82-88 for 85 GB)
+    for (const tier of allTiers) {
+        const diff = Math.abs(g - tier);
+        if (diff <= 5 && diff < minDiff) {
+            minDiff = diff;
+            bestTier = tier;
+        }
+    }
+    if (bestTier !== null) return bestTier;
+
+    return intG;
+}
 
 async function getPackagePrices() {
     const now = Date.now();
@@ -312,14 +360,21 @@ async function getPackagePrices() {
     return packagePricesCache;
 }
 
+function getPackagePriceSync(gigs, prices = {}) {
+    const tier = resolvePackageTier(gigs, prices);
+    if (prices[tier] !== undefined) return Number(prices[tier]);
+    if (prices[String(tier)] !== undefined) return Number(prices[String(tier)]);
+    const defaultTier = resolvePackageTier(gigs, DEFAULT_PACKAGE_PRICES);
+    return DEFAULT_PACKAGE_PRICES[defaultTier] || 0;
+}
+
 async function getPackagePrice(gigs) {
     const prices = await getPackagePrices();
-    const g = parseInt(gigs, 10);
-    if (!isNaN(g)) {
-        if (prices[g] !== undefined) return Number(prices[g]);
-        if (prices[String(g)] !== undefined) return Number(prices[String(g)]);
-    }
-    return DEFAULT_PACKAGE_PRICES[g] || 0;
+    const tier = resolvePackageTier(gigs, prices);
+    if (prices[tier] !== undefined) return Number(prices[tier]);
+    if (prices[String(tier)] !== undefined) return Number(prices[String(tier)]);
+    const defaultTier = resolvePackageTier(gigs, DEFAULT_PACKAGE_PRICES);
+    return DEFAULT_PACKAGE_PRICES[defaultTier] || 0;
 }
 
 const STATUSES = ['محجوز', 'ضن', 'اتفعل', 'متأكتف', 'متكنسل'];
@@ -2206,7 +2261,7 @@ app.put('/api/owners/:id/name', async (req, res) => {
 app.get('/api/settings/package-prices', async (req, res) => {
     try {
         const prices = await getPackagePrices();
-        res.json({ success: true, data: prices });
+        res.json({ success: true, data: prices, prices });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
@@ -2229,7 +2284,7 @@ app.post('/api/settings/package-prices', async (req, res) => {
         await dbRun(`INSERT INTO settings (key, value) VALUES ('package_prices', ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify(cleanPrices)]);
         packagePricesCache = cleanPrices;
         packagePricesCacheTime = Date.now();
-        res.json({ success: true, message: 'تم حفظ وتحديث أسعار الباقات بنجاح ✅', data: cleanPrices });
+        res.json({ success: true, message: 'تم حفظ وتحديث أسعار الباقات بنجاح ✅', data: cleanPrices, prices: cleanPrices });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
@@ -3884,7 +3939,7 @@ async function sendDailyRenewalReminders() {
         // Reminder sent within 3 days before renewal (3, 2, 1), on renewal day (0), or up to 3 days late
         if (daysToRenewal >= -3 && daysToRenewal <= 3) {
             const effectiveGigs = b.next_gigabytes || b.gigabytes;
-            const price = prices[effectiveGigs] || prices[String(effectiveGigs)] || (await getPackagePrice(effectiveGigs));
+            const price = await getPackagePrice(effectiveGigs);
 
             let timeBadge = '';
             if (daysToRenewal === 3) timeBadge = 'متبقي 3 أيام على التجديد ⏳';
@@ -4452,12 +4507,15 @@ app.post('/api/customer/login', async (req, res) => {
                 [phone]
             ) : null;
             if (pendingReg) {
+                const pendingPrice = await getPackagePrice(pendingReg.gigabytes);
                 return res.json({
                     success: true,
                     data: {
                         id: null,
                         phone: pendingReg.phone,
                         gigabytes: pendingReg.gigabytes,
+                        amount: pendingPrice,
+                        price: pendingPrice,
                         renewal_day: pendingReg.renewal_day,
                         status: 'قيد المراجعة',
                         created_at: pendingReg.created_at,
@@ -4569,6 +4627,7 @@ app.post('/api/customer/login', async (req, res) => {
         }
 
 
+        const calculatedPrice = await getPackagePrice(booking.gigabytes);
         res.json({
             success: true,
             data: {
@@ -4578,6 +4637,8 @@ app.post('/api/customer/login', async (req, res) => {
                 name: booking.name || null,
                 phone: booking.phone,
                 gigabytes: booking.gigabytes,
+                amount: calculatedPrice,
+                price: calculatedPrice,
                 renewal_day: booking.renewal_day,
                 status: booking.status,
                 last_usage_data: booking.last_usage_data || null,
@@ -4749,7 +4810,7 @@ app.post('/api/customer/pay', async (req, res) => {
             if (!phone || !gigabytes || !renewal_day) {
                 return res.status(400).json({ success: false, error: 'بيانات الحجز ناقصة' });
             }
-            const price = getPackagePrice(gigabytes);
+            const price = await getPackagePrice(gigabytes);
             if (!price) return res.status(400).json({ success: false, error: 'باقة غير صحيحة' });
 
             // Determine active booking month for self-registration
@@ -4869,7 +4930,7 @@ app.post('/api/customer/pay', async (req, res) => {
         }
 
         // Constraint 3: If rejected (or no prior payment for this month) -> allow inserting a new pending payment!
-        const price = getPackagePrice(booking.gigabytes);
+        const price = await getPackagePrice(booking.gigabytes);
         const result = await dbRun(
             `INSERT INTO customer_payments(
                 booking_id, year_month, amount, method, sender_phone, sender_name,

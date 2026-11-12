@@ -93,20 +93,41 @@ async function loadLivePackagePrices() {
     try {
         const r = await fetch(`${API}/api/settings/package-prices`);
         const j = await r.json();
-        if (j.success && j.data) {
-            livePackagePrices = j.data;
+        const prices = (j && (j.data || j.prices)) ? (j.data || j.prices) : null;
+        if (prices) {
+            livePackagePrices = prices;
             return livePackagePrices;
         }
     } catch (_) {}
     return null;
 }
 function getPackagePrice(gigs) {
-    const g = parseInt(gigs);
-    if (livePackagePrices && livePackagePrices[g] !== undefined) {
-        return Number(livePackagePrices[g]);
+    const raw = parseFloat(gigs);
+    if (!raw || isNaN(raw) || raw <= 0) return 'غير محدد';
+
+    const p = (livePackagePrices && Object.keys(livePackagePrices).length > 0)
+        ? livePackagePrices
+        : { 20: 250, 30: 350, 40: 450, 50: 550, 60: 600, 70: 700, 85: 800, 100: 950 };
+
+    const rounded = Math.round(raw);
+    if (p[rounded] !== undefined) return Number(p[rounded]);
+
+    // Check nearest tier within ±3.5 GB tolerance (and ±5 GB for 85)
+    let bestKey = null;
+    let minDiff = Infinity;
+    for (const k of Object.keys(p)) {
+        const tierGb = parseFloat(k);
+        if (isNaN(tierGb)) continue;
+        const diff = Math.abs(raw - tierGb);
+        const maxTol = (tierGb === 85) ? 5.5 : 3.5;
+        if (diff <= maxTol && diff < minDiff) {
+            minDiff = diff;
+            bestKey = k;
+        }
     }
-    const prices = { 20: 250, 30: 350, 40: 450, 50: 550, 60: 600, 70: 700, 85: 800 };
-    return prices[g] || 'غير محدد';
+    if (bestKey && p[bestKey] !== undefined) return Number(p[bestKey]);
+
+    return p[rounded] || 'غير محدد';
 }
 
 // Auth State
