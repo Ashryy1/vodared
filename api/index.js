@@ -1271,12 +1271,6 @@ async function sendVodafoneFamilyInvitation(owner, memberPhone, quotaGB, minutes
     let context = { roleName: "EnterpriseRedFamily", categories: [], members: [] };
     try {
         context = await resolveVodafoneFamilyContext(owner, cleanMemberPhone);
-        if (context.hasFamilyGroup === false) {
-            return {
-                success: false,
-                error: context.error || `خط الأونر (${cleanOwnerPhone}) غير مفعل عليه باقة عائلة في شبكة فودافون (${owner.plan || 'باقة غير مدعومة'}). يرجى التأكد من باقة الخط لدى فودافون.`
-            };
-        }
         if (context.matchedMember && (String(context.matchedMember.status) === '1' || String(context.matchedMember.status) === '5')) {
             return {
                 success: false,
@@ -1330,18 +1324,38 @@ async function sendVodafoneFamilyInvitation(owner, memberPhone, quotaGB, minutes
         }
     };
 
-    console.log(`[ADD_MEMBER] Dispatching Vodafone DXL invitation to ${cleanMemberPhone}...`);
-    const resp = await callVodafoneForOwner(
+    console.log(`[ADD_MEMBER] Dispatching Vodafone DXL invitation to ${cleanMemberPhone} using role ${roleName}...`);
+    let resp = await callVodafoneForOwner(
         owner,
         VODAFONE_CUSTOMER_GROUP_URL,
         "POST",
         payload
     );
 
-    const err = extractVodafoneError(resp.data, resp.status);
+    let err = extractVodafoneError(resp.data, resp.status);
     if ((resp.ok || resp.status === 200 || resp.status === 201) && !err) {
         return { success: true, result: resp.data };
     }
+
+    // If role was assumed and request failed with 400 or 404, attempt alternate role (EnterpriseRedFamily <-> RedFamily)
+    if (!resp.ok && (resp.status === 400 || resp.status === 404)) {
+        const altRole = roleName === "EnterpriseRedFamily" ? "RedFamily" : (roleName === "RedFamily" ? "EnterpriseRedFamily" : null);
+        if (altRole && !context.inquiryConfirmedMembers) {
+            console.log(`[ADD_MEMBER] Retrying SendInvitation with alternate role ${altRole} for ${cleanMemberPhone}...`);
+            const fallbackPayload = { ...payload, name: altRole };
+            const fallbackResp = await callVodafoneForOwner(
+                owner,
+                VODAFONE_CUSTOMER_GROUP_URL,
+                "POST",
+                fallbackPayload
+            );
+            const fbErr = extractVodafoneError(fallbackResp.data, fallbackResp.status);
+            if ((fallbackResp.ok || fallbackResp.status === 200 || fallbackResp.status === 201) && !fbErr) {
+                return { success: true, result: fallbackResp.data };
+            }
+        }
+    }
+
     return { success: false, error: err || `فشل إرسال الدعوة بكود ${resp.status}` };
 }
 
@@ -1398,7 +1412,7 @@ async function resolveVodafoneFamilyContext(owner, targetMemberPhone = null) {
         const fg = Array.isArray(inquiryResp.data) ? inquiryResp.data[0] : inquiryResp.data;
         if (inquiryResp.status === 404 || (fg && (fg.code === "1001" || fg.reason === "No Data Found"))) {
             return {
-                hasFamilyGroup: false,
+                hasFamilyGroup: true,
                 roleName,
                 categories,
                 templateCategory,
@@ -1406,7 +1420,7 @@ async function resolveVodafoneFamilyContext(owner, targetMemberPhone = null) {
                 members: [],
                 ownerMember: null,
                 matchedMember: null,
-                error: `خط الأونر (${owner.phone}) غير مفعل عليه باقة عائلة في شبكة فودافون (${owner.plan || 'No Family Group'}). يرجى التأكد من تفعيل باقة العائلة للخط أولاً.`
+                error: null
             };
         }
         if (inquiryResp.ok && fg && typeof fg === "object") {
