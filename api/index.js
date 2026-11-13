@@ -362,7 +362,7 @@ function resolvePackageTier(rawGigs, availablePrices = {}) {
 
 async function getPackagePrices() {
     const now = Date.now();
-    if (packagePricesCache && (now - packagePricesCacheTime < 30000)) {
+    if (packagePricesCache && (now - packagePricesCacheTime < 10000)) {
         return packagePricesCache;
     }
     try {
@@ -373,9 +373,19 @@ async function getPackagePrices() {
                 try { parsed = JSON.parse(parsed); } catch (_) {}
             }
             if (typeof parsed === 'object' && parsed !== null && Object.keys(parsed).length > 0) {
-                packagePricesCache = parsed;
-                packagePricesCacheTime = now;
-                return parsed;
+                const clean = {};
+                for (const [k, v] of Object.entries(parsed)) {
+                    const nk = Number(k);
+                    const nv = Number(v);
+                    if (!isNaN(nk) && nk > 0 && !isNaN(nv) && nv > 0) {
+                        clean[nk] = nv;
+                    }
+                }
+                if (Object.keys(clean).length > 0) {
+                    packagePricesCache = clean;
+                    packagePricesCacheTime = now;
+                    return clean;
+                }
             }
         }
     } catch (_) {}
@@ -2556,6 +2566,7 @@ app.put('/api/owners/:id/name', async (req, res) => {
 // 8a-3. Package Prices Management (Super Admin)
 app.get('/api/settings/package-prices', async (req, res) => {
     try {
+        packagePricesCache = null; // Fresh fetch from DB
         const prices = await getPackagePrices();
         res.json({ success: true, data: prices, prices });
     } catch (e) {
@@ -2577,7 +2588,9 @@ app.post('/api/settings/package-prices', async (req, res) => {
                 cleanPrices[numKey] = numVal;
             }
         }
-        await dbRun(`INSERT INTO settings (key, value) VALUES ('package_prices', ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [JSON.stringify(cleanPrices)]);
+        const valStr = JSON.stringify(cleanPrices);
+        await dbRun(`DELETE FROM settings WHERE key = 'package_prices'`);
+        await dbRun(`INSERT INTO settings (key, value) VALUES ('package_prices', ?)`, [valStr]);
         packagePricesCache = cleanPrices;
         packagePricesCacheTime = Date.now();
         res.json({ success: true, message: 'تم حفظ وتحديث أسعار الباقات بنجاح ✅', data: cleanPrices, prices: cleanPrices });
