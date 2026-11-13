@@ -38,12 +38,25 @@ function replaceParams(sql) {
 async function dbRun(sql, params = []) {
     const pgSql = replaceParams(sql);
     let finalSql = pgSql;
-    // Add RETURNING id if it's an insert to mimic SQLite's lastID
-    if (finalSql.trim().toUpperCase().startsWith('INSERT') && !finalSql.toUpperCase().includes('RETURNING')) {
-        finalSql += ' RETURNING id';
+    const isInsert = finalSql.trim().toUpperCase().startsWith('INSERT');
+    const hasReturning = finalSql.toUpperCase().includes('RETURNING');
+    const isNoIdTable = /INSERT\s+INTO\s+["']?(settings|global_settings)["']?\s+/i.test(finalSql);
+
+    // Add RETURNING id if it's an insert to mimic SQLite's lastID (except for tables without an id column)
+    if (isInsert && !hasReturning && !isNoIdTable) {
+        try {
+            const res = await pool.query(finalSql + ' RETURNING id', params);
+            return { lastID: res.rows[0]?.id, changes: res.rowCount };
+        } catch (err) {
+            if (err.code === '42703' || (err.message && err.message.includes('column "id" does not exist'))) {
+                const res = await pool.query(finalSql, params);
+                return { lastID: undefined, changes: res.rowCount };
+            }
+            throw err;
+        }
     }
     const res = await pool.query(finalSql, params);
-    return { lastID: res.rows[0]?.id, changes: res.rowCount };
+    return { lastID: res.rows?.[0]?.id, changes: res.rowCount };
 }
 
 async function dbAll(sql, params = []) {
@@ -371,21 +384,41 @@ async function getPackagePrices() {
     return packagePricesCache;
 }
 
+function resolveBestPrice(rawGigs, userPrices = {}, defaultPrices = DEFAULT_PACKAGE_PRICES) {
+    const g = parseFloat(rawGigs);
+    if (isNaN(g) || g <= 0) return 0;
+
+    const mergedPrices = { ...defaultPrices };
+    if (userPrices && typeof userPrices === 'object') {
+        for (const [k, v] of Object.entries(userPrices)) {
+            const numVal = Number(v);
+            if (!isNaN(numVal) && numVal > 0) {
+                mergedPrices[k] = numVal;
+            }
+        }
+    }
+
+    const intG = Math.round(g);
+    if (Number(mergedPrices[g]) > 0) return Number(mergedPrices[g]);
+    if (Number(mergedPrices[intG]) > 0) return Number(mergedPrices[intG]);
+    if (Number(mergedPrices[String(intG)]) > 0) return Number(mergedPrices[String(intG)]);
+
+    const available = Object.entries(mergedPrices)
+        .map(([k, v]) => ({ tier: Number(k), price: Number(v) }))
+        .filter(x => !isNaN(x.tier) && x.tier > 0 && !isNaN(x.price) && x.price > 0);
+
+    if (available.length === 0) return 0;
+    available.sort((a, b) => Math.abs(g - a.tier) - Math.abs(g - b.tier));
+    return available[0].price;
+}
+
 function getPackagePriceSync(gigs, prices = {}) {
-    const tier = resolvePackageTier(gigs, prices);
-    if (prices[tier] !== undefined) return Number(prices[tier]);
-    if (prices[String(tier)] !== undefined) return Number(prices[String(tier)]);
-    const defaultTier = resolvePackageTier(gigs, DEFAULT_PACKAGE_PRICES);
-    return DEFAULT_PACKAGE_PRICES[defaultTier] || 0;
+    return resolveBestPrice(gigs, prices, DEFAULT_PACKAGE_PRICES);
 }
 
 async function getPackagePrice(gigs) {
     const prices = await getPackagePrices();
-    const tier = resolvePackageTier(gigs, prices);
-    if (prices[tier] !== undefined) return Number(prices[tier]);
-    if (prices[String(tier)] !== undefined) return Number(prices[String(tier)]);
-    const defaultTier = resolvePackageTier(gigs, DEFAULT_PACKAGE_PRICES);
-    return DEFAULT_PACKAGE_PRICES[defaultTier] || 0;
+    return resolveBestPrice(gigs, prices, DEFAULT_PACKAGE_PRICES);
 }
 
 const STATUSES = ['محجوز', 'ضن', 'اتفعل', 'متأكتف', 'متكنسل'];
@@ -1704,11 +1737,18 @@ async function onMemberInvitationAccepted(booking, owner, ownerName, gigabytes, 
 
     console.log(`[INVITATION_ACCEPTED] Member ${cleanMemberPhone} accepted! Notifying Super Admin...`);
 
-    // 1. Update DB booking status to 'متأكتف'
+    // 1. Update DB booking status to 'متأكتف' and mark initial month as paid (first cycle already paid)
     try {
         await dbRun(
             `UPDATE bookings SET status = 'متأكتف', invitation_accepted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
             [booking.id]
+        );
+        const currentYm = currentMonth();
+        await dbRun(
+            `INSERT INTO monthly_payments (booking_id, renewal_day, year_month, paid, paid_at, activated, activated_at)
+             VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)
+             ON CONFLICT DO NOTHING`,
+            [booking.id, resolvedDay, currentYm]
         );
     } catch (e) {
         console.warn('Could not update booking status:', e.message);
@@ -1907,6 +1947,16 @@ async function syncOwnerFamilyMembersToDb(ownerObj, vfData, resolvedName, resolv
                     [ownerObj.id, ownerPhone, resolvedName || null, cleanM, mGigs, m.megabytes || (mGigs * 1024), m.voice || 0, m.sms || 0, resolvedRenewalDay, `فرد (${cleanM.slice(-4)})`]
                 );
                 primaryId = insertRes.lastID;
+                // New active subscriber: First month is ALREADY PAID upon joining!
+                try {
+                    const curYm = currentMonth();
+                    await dbRun(
+                        `INSERT INTO monthly_payments (booking_id, renewal_day, year_month, paid, paid_at, activated, activated_at)
+                         VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)
+                         ON CONFLICT DO NOTHING`,
+                        [primaryId, resolvedRenewalDay, curYm]
+                    );
+                } catch (_) {}
             }
             syncedCount++;
             syncedPhones.push(cleanM);
@@ -4419,6 +4469,30 @@ async function sendDailyRenewalReminders() {
         const pendingPay = await dbGet(`SELECT id FROM customer_payments WHERE booking_id = ? AND year_month = ? AND status = 'pending'`, [b.id, ym]);
         if (pendingPay) {
             continue;
+        }
+
+        // Skip if newly added/activated: the first month is ALREADY PAID upon joining!
+        // (Any subscriber added in current month or less than 22 days ago is on their first paid month)
+        const activationDateStr = b.invitation_accepted_at || b.created_at;
+        if (activationDateStr) {
+            const actDate = new Date(activationDateStr);
+            if (!isNaN(actDate.getTime())) {
+                const actYm = `${actDate.getFullYear()}-${String(actDate.getMonth() + 1).padStart(2, '0')}`;
+                const daysSinceActivation = (Date.now() - actDate.getTime()) / (1000 * 60 * 60 * 24);
+
+                if (actYm === ym || daysSinceActivation < 22) {
+                    try {
+                        await dbRun(
+                            `INSERT INTO monthly_payments (booking_id, renewal_day, year_month, paid, paid_at, activated, activated_at)
+                             VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)
+                             ON CONFLICT DO NOTHING`,
+                            [b.id, b.renewal_day || 7, ym]
+                        );
+                    } catch (_) {}
+                    skippedPaid++;
+                    continue;
+                }
+            }
         }
 
         const daysToRenewal = b.renewal_day - today;
