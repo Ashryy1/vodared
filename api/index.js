@@ -259,14 +259,7 @@ async function initDB() {
         await pool.query(`INSERT INTO bot_admins (tg_id, name) VALUES ('1255885099', 'Super Admin') ON CONFLICT (tg_id) DO NOTHING;`);
     } catch (_) {}
 
-    try {
-        await pool.query(`
-            INSERT INTO settings(key, value) VALUES (
-                'sixth_month_reminder_template', 
-                '"⚠️ *تنبيه دورة التجديد السادسة والأخيرة*\n\nعزيزي العميل،\nنحيطك علماً بأن باقة الخط {phone} قد وصلت إلى *الشهر السادس* (نهاية دورة الـ 6 شهور).\nهذا هو الشهر الأخير في دورتك الحالية.\nبعد انتهاء هذا الشهر، يمكنك اختيار الخروج من النظام أو تجديد دورة جديدة لمدة 6 شهور أخرى.\n\nلأي استفسار يرجى التواصل مع الدعم الفني."'
-            ) ON CONFLICT (key) DO NOTHING;
-        `);
-    } catch (_) {}
+
 }
 
 let dbInitPromise = null;
@@ -3223,7 +3216,8 @@ app.get('/api/bookings', async (req, res) => {
             COALESCE(o.name, b.owner_name, b.owner_phone, 'أونر فودافون') as owner_name,
             COALESCE(b.owner_phone, o.phone) as owner_phone,
             (SELECT COUNT(id)::int FROM booking_chats WHERE booking_id = b.id) as chats_count,
-            GREATEST(1, COALESCE((SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) + 1, 1)) as renewal_count,
+            GREATEST(1, COALESCE((SELECT COUNT(*)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1), 1)) as renewal_count,
+            (SELECT COALESCE(mp.paid, 0)::int FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.year_month = '${currentMonth()}' LIMIT 1) as paid_this_month,
             (SELECT MIN(mp.year_month) FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as first_paid_month,
             (SELECT MAX(mp.year_month) FROM monthly_payments mp WHERE mp.booking_id = b.id AND mp.paid = 1) as latest_paid_month
             FROM bookings b 
@@ -6092,102 +6086,7 @@ app.post('/api/payments/:id/reject', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// Cycle 6 Lines Management
-app.get('/api/admin/cycle-six-lines', async (req, res) => {
-    try {
-        const { filter } = req.query;
-        const ym = currentMonth();
-        const bookings = await dbAll(`SELECT * FROM bookings WHERE deleted_at IS NULL AND (status IS NULL OR status != 'متكنسل') ORDER BY renewal_day ASC, created_at ASC`);
-        if (!bookings.length) return res.json({ success: true, data: [] });
 
-        const ids = bookings.map(b => b.id);
-        const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
-        const counts = await dbAll(`SELECT booking_id, COUNT(*)::int as cnt FROM monthly_payments WHERE booking_id IN (${placeholders}) AND paid = 1 GROUP BY booking_id`, ids);
-        const countMap = {};
-        counts.forEach(r => countMap[r.booking_id] = r.cnt);
-
-        const currentPays = await dbAll(`SELECT * FROM monthly_payments WHERE booking_id IN (${placeholders}) AND year_month = $${ids.length + 1}`, [...ids, ym]);
-        const payMap = {};
-        currentPays.forEach(r => payMap[r.booking_id] = r);
-
-        const result = bookings.map(b => {
-            const renewalCount = countMap[b.id] || 0;
-            const completedCycles = Math.floor(renewalCount / 6);
-            const remainder = renewalCount % 6;
-
-            let cycleStatus = 'normal';
-            if (remainder === 5) {
-                cycleStatus = 'in_month_6'; // في الشهر السادس والأخير من الدورة
-            } else if (renewalCount >= 6 && remainder === 0) {
-                cycleStatus = 'completed_cycle'; // أتم 6 شهور بالكامل (دورة مكتملة)
-            }
-
-            return {
-                ...b,
-                renewal_count: renewalCount,
-                completed_cycles: completedCycles,
-                month_in_cycle: remainder === 0 && renewalCount > 0 ? 6 : remainder + 1,
-                cycle_status: cycleStatus,
-                paid_this_month: payMap[b.id]?.paid === 1,
-                current_payment: payMap[b.id] || null
-            };
-        }).filter(b => {
-            if (filter === 'month6') return b.cycle_status === 'in_month_6';
-            if (filter === 'completed') return b.cycle_status === 'completed_cycle';
-            return b.cycle_status === 'in_month_6' || b.cycle_status === 'completed_cycle';
-        });
-
-        res.json({ success: true, data: result });
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-app.post('/api/admin/send-cycle-six-reminder', async (req, res) => {
-    try {
-        const { booking_id, custom_message } = req.body;
-        if (!booking_id) return res.status(400).json({ success: false, error: 'معرف الخط مطلوب' });
-
-        const booking = await dbGet(`SELECT * FROM bookings WHERE id = ? AND deleted_at IS NULL`, [booking_id]);
-        if (!booking) return res.status(404).json({ success: false, error: 'الخط غير موجود' });
-        if (!booking.owner_tg) return res.status(400).json({ success: false, error: 'هذا الرقم غير مربوط بحساب تليجرام' });
-
-        const botInstance = await getBot();
-        if (!botInstance) return res.status(500).json({ success: false, error: 'بوت تليجرام غير متاح' });
-
-        let template = custom_message;
-        if (!template) {
-            const tmplRow = await dbGet(`SELECT value FROM settings WHERE key = 'sixth_month_reminder_template'`);
-            if (tmplRow && tmplRow.value) {
-                try { template = JSON.parse(tmplRow.value); } catch (e) { template = tmplRow.value; }
-            }
-        }
-        if (!template) {
-            template = "⚠️ *تنبيه دورة التجديد السادسة والأخيرة*\n\nعزيزي العميل،\nنحيطك علماً بأن باقة الخط {phone} قد وصلت إلى *الشهر السادس* (نهاية دورة الـ 6 شهور).\nهذا هو الشهر الأخير في دورتك الحالية.\nبعد انتهاء هذا الشهر، يمكنك اختيار الخروج من النظام أو تجديد دورة جديدة لمدة 6 شهور أخرى.\n\nلأي استفسار يرجى التواصل مع الدعم الفني.";
-        }
-
-        const msg = template
-            .replace(/\{phone\}/g, booking.phone)
-            .replace(/\{giga\}/g, String(booking.gigabytes || ''))
-            .replace(/\{renewal_day\}/g, String(booking.renewal_day || ''))
-            .replace(/\{owner_username\}/g, booking.owner_username ? `@${booking.owner_username}` : 'عزيزي العميل');
-
-        const webAppUrl = process.env.WEBAPP_URL || 'https://vodared.vercel.app';
-        await botInstance.sendMessage(booking.owner_tg, msg, {
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: '📱 فتح التطبيق', web_app: { url: webAppUrl } }],
-                    [{ text: '💬 تواصل مع الدعم الفني', url: 'https://t.me/hak_alqulub' }]
-                ]
-            },
-            parse_mode: 'Markdown'
-        });
-
-        res.json({ success: true, message: `تم إرسال تنبيه الشهر السادس إلى ${booking.phone} بنجاح` });
-    } catch (e) {
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
 
 app.get('/api/admins', async (req, res) => {
     try {
